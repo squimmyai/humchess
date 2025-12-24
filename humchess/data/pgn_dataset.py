@@ -16,7 +16,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 from .tokenization import (
     SEQ_LENGTH, NUM_MOVE_CLASSES,
-    fen_to_tokens, normalize_position, move_to_ids, is_promotion_move,
+    board_to_tokens, normalize_position, move_to_ids, is_promotion_move,
 )
 
 
@@ -77,6 +77,7 @@ class PGNDataset(IterableDataset):
         min_elo: int = 0,
         max_elo: int = 4000,
         skip_first_n_plies: int = 0,
+        include_metadata: bool = False,
     ):
         """
         Args:
@@ -89,6 +90,8 @@ class PGNDataset(IterableDataset):
         self.min_elo = min_elo
         self.max_elo = max_elo
         self.skip_first_n_plies = skip_first_n_plies
+        self.include_metadata = include_metadata
+        self._legal_mask_cache: dict[tuple[int, ...], torch.Tensor] = {}
 
     def __iter__(self) -> Iterator[dict]:
         worker_info = get_worker_info()
@@ -110,20 +113,26 @@ class PGNDataset(IterableDataset):
     def _iter_pgn(self, path: Path) -> Iterator[dict]:
         """Iterate over all positions in a single PGN file."""
         with open(path, 'r', errors='replace') as f:
+            game_idx = 0
             while True:
                 game = chess.pgn.read_game(f)
                 if game is None:
                     break
 
-                yield from self._iter_game(game)
+                yield from self._iter_game(game, path, game_idx)
+                game_idx += 1
 
-    def _iter_game(self, game: chess.pgn.Game) -> Iterator[dict]:
+    def _iter_game(
+        self,
+        game: chess.pgn.Game,
+        path: Path,
+        game_idx: int,
+    ) -> Iterator[dict]:
         """Iterate over positions in a single game."""
         # Extract headers
         headers = game.headers
         white_elo = self._parse_elo(headers.get('WhiteElo'))
         black_elo = self._parse_elo(headers.get('BlackElo'))
-        time_control = parse_time_control(headers.get('TimeControl', ''))
 
         # Filter by Elo
         if white_elo is None or black_elo is None:
@@ -154,11 +163,10 @@ class PGNDataset(IterableDataset):
             time_left = self._get_clock_from_node(node)
 
             # Get position before move
-            fen = board.fen()
             move_uci = move.uci()
 
             # Convert to tokens (returns tuple with is_black_to_move flag)
-            tokens, is_black = fen_to_tokens(fen, elo, time_left)
+            tokens, is_black = board_to_tokens(board, elo, time_left)
 
             # Apply white normalization
             tokens, move_uci = normalize_position(tokens, move_uci, is_black)
@@ -169,9 +177,13 @@ class PGNDataset(IterableDataset):
             # Create legality mask (using normalized position)
             # We need to recreate the board for the normalized position
             # For simplicity, we use the original board's legal moves and transform them
-            legal_move_ids = self._get_normalized_legal_moves(board, is_black)
-            legal_mask = torch.zeros(NUM_MOVE_CLASSES, dtype=torch.bool)
-            legal_mask[legal_move_ids] = True
+            cache_key = tuple(tokens[1:66])
+            legal_mask = self._legal_mask_cache.get(cache_key)
+            if legal_mask is None:
+                legal_move_ids = self._get_normalized_legal_moves(board, is_black)
+                legal_mask = torch.zeros(NUM_MOVE_CLASSES, dtype=torch.bool)
+                legal_mask[legal_move_ids] = True
+                self._legal_mask_cache[cache_key] = legal_mask
 
             # Check if promotion
             board_tokens = tokens[1:65]  # squares only
@@ -183,6 +195,15 @@ class PGNDataset(IterableDataset):
                 'promo_id': promo_id if promo_id is not None else -1,
                 'legal_mask': legal_mask,
                 'is_promotion': is_promo,
+                **(
+                    {
+                        'meta': {
+                            'file': str(path),
+                            'game': game_idx,
+                            'ply': ply,
+                        }
+                    } if self.include_metadata else {}
+                ),
             }
 
             # Advance position

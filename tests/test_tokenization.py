@@ -2,6 +2,8 @@
 
 import pytest
 
+import chess
+
 from humchess.data.tokenization import (
     VOCAB_SIZE,
     SEQ_LENGTH,
@@ -10,6 +12,7 @@ from humchess.data.tokenization import (
     Piece,
     Special,
     fen_to_tokens,
+    board_to_tokens,
     normalize_position,
     move_to_ids,
     ids_to_move,
@@ -117,9 +120,19 @@ class TestTimeBuckets:
 
 
 class TestFenToTokens:
+    def test_starting_position_black(self):
+        fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
+        tokens, is_black = fen_to_tokens(fen, elo=1500, time_left_seconds=300)
+
+        assert is_black is True
+        assert len(tokens) == SEQ_LENGTH
+
+
+class TestBoardToTokens:
     def test_starting_position_white(self):
         fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-        tokens, is_black = fen_to_tokens(fen, elo=1500, time_left_seconds=300)
+        board = chess.Board(fen)
+        tokens, is_black = board_to_tokens(board, elo=1500, time_left_seconds=300)
 
         assert len(tokens) == SEQ_LENGTH
         assert is_black is False
@@ -133,18 +146,22 @@ class TestFenToTokens:
         # E8 = black king
         assert tokens[61] == Piece.BK
 
-    def test_starting_position_black(self):
-        fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
-        tokens, is_black = fen_to_tokens(fen, elo=1500, time_left_seconds=300)
-
-        assert is_black is True
-
     def test_empty_squares(self):
         fen = "8/8/8/8/8/8/8/8 w - - 0 1"
-        tokens, _ = fen_to_tokens(fen, elo=1500)
+        board = chess.Board(fen)
+        tokens, _ = board_to_tokens(board, elo=1500)
 
         for i in range(1, 65):
             assert tokens[i] == Piece.EMPTY
+
+    def test_matches_fen(self):
+        fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
+        board = chess.Board(fen)
+        tokens_fen, is_black_fen = fen_to_tokens(fen, elo=1500, time_left_seconds=300)
+        tokens_board, is_black_board = board_to_tokens(board, elo=1500, time_left_seconds=300)
+
+        assert tokens_fen == tokens_board
+        assert is_black_fen == is_black_board
 
 
 class TestNormalization:

@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 from .data.tokenization import (
     NUM_MOVE_CLASSES,
-    fen_to_tokens, normalize_position, move_to_ids, ids_to_move,
+    board_to_tokens, normalize_position, move_to_ids, ids_to_move,
     is_promotion_move, denormalize_move,
 )
 from .model.transformer import ChessTransformer
@@ -75,7 +75,7 @@ def predict_move(
     board = chess.Board(fen)
 
     # Convert to tokens (returns is_black flag)
-    tokens, is_black = fen_to_tokens(fen, elo, time_left_seconds)
+    tokens, is_black = board_to_tokens(board, elo, time_left_seconds)
 
     # Create a dummy move for normalization (we'll use any legal move)
     dummy_move = list(board.legal_moves)[0].uci()
@@ -150,7 +150,7 @@ def predict_move_distribution(
     board = chess.Board(fen)
 
     # Convert to tokens (returns is_black flag)
-    tokens, is_black = fen_to_tokens(fen, elo, time_left_seconds)
+    tokens, is_black = board_to_tokens(board, elo, time_left_seconds)
 
     # Dummy move for normalization
     dummy_move = list(board.legal_moves)[0].uci()

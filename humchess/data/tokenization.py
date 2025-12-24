@@ -44,6 +44,21 @@ PIECE_CHAR_TO_TOKEN = {
     'r': Piece.BR, 'q': Piece.BQ, 'k': Piece.BK,
 }
 
+PIECE_TYPE_COLOR_TO_TOKEN = {
+    (chess.PAWN, chess.WHITE): Piece.WP,
+    (chess.KNIGHT, chess.WHITE): Piece.WN,
+    (chess.BISHOP, chess.WHITE): Piece.WB,
+    (chess.ROOK, chess.WHITE): Piece.WR,
+    (chess.QUEEN, chess.WHITE): Piece.WQ,
+    (chess.KING, chess.WHITE): Piece.WK,
+    (chess.PAWN, chess.BLACK): Piece.BP,
+    (chess.KNIGHT, chess.BLACK): Piece.BN,
+    (chess.BISHOP, chess.BLACK): Piece.BB,
+    (chess.ROOK, chess.BLACK): Piece.BR,
+    (chess.QUEEN, chess.BLACK): Piece.BQ,
+    (chess.KING, chess.BLACK): Piece.BK,
+}
+
 
 # =============================================================================
 # Special Tokens
@@ -159,26 +174,6 @@ def idx_to_square_name(idx: int) -> str:
 # FEN Parsing
 # =============================================================================
 
-def _parse_fen_pieces(fen_pieces: str) -> list[int]:
-    """Parse FEN piece placement to 64 piece tokens."""
-    tokens = [Piece.EMPTY] * 64
-    ranks = fen_pieces.split('/')
-    for rank_idx, rank_str in enumerate(reversed(ranks)):
-        file_idx = 0
-        for char in rank_str:
-            if char.isdigit():
-                file_idx += int(char)
-            else:
-                tokens[rank_idx * 8 + file_idx] = PIECE_CHAR_TO_TOKEN[char]
-                file_idx += 1
-    return tokens
-
-
-def _parse_castling_fen(castling_str: str) -> tuple[bool, bool, bool, bool]:
-    """Parse FEN castling rights string to (WK, WQ, BK, BQ)."""
-    return 'K' in castling_str, 'Q' in castling_str, 'k' in castling_str, 'q' in castling_str
-
-
 # =============================================================================
 # Position to Tokens
 # =============================================================================
@@ -194,14 +189,34 @@ def fen_to_tokens(
     Returns:
         (tokens, is_black_to_move) where tokens is [CLS, SQ_0..SQ_63, CASTLING, ELO, TL]
     """
-    parts = fen.split()
+    board = chess.Board(fen)
+    return board_to_tokens(board, elo, time_left_seconds)
+
+
+def board_to_tokens(
+    board: chess.Board,
+    elo: int,
+    time_left_seconds: Optional[float] = None,
+) -> tuple[list[int], bool]:
+    """
+    Convert Board + metadata to token sequence without FEN.
+
+    Returns:
+        (tokens, is_black_to_move) where tokens is [CLS, SQ_0..SQ_63, CASTLING, ELO, TL]
+    """
     tokens = [Special.CLS]
-    tokens.extend(_parse_fen_pieces(parts[0]))
-    wk, wq, bk, bq = _parse_castling_fen(parts[2])
+    squares = [Piece.EMPTY] * 64
+    for sq, piece in board.piece_map().items():
+        squares[sq] = PIECE_TYPE_COLOR_TO_TOKEN[(piece.piece_type, piece.color)]
+    tokens.extend(squares)
+    wk = board.has_kingside_castling_rights(chess.WHITE)
+    wq = board.has_queenside_castling_rights(chess.WHITE)
+    bk = board.has_kingside_castling_rights(chess.BLACK)
+    bq = board.has_queenside_castling_rights(chess.BLACK)
     tokens.append(castling_token(wk, wq, bk, bq))
     tokens.append(elo_bucket_token(elo))
     tokens.append(tl_bucket_token(time_left_seconds))
-    return tokens, parts[1] == 'b'
+    return tokens, board.turn == chess.BLACK
 
 
 # =============================================================================

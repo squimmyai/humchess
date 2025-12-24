@@ -78,14 +78,14 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int):
         super().__init__()
-        self.ln1 = RMSNorm(d_model)
+        self.rmsnorm1 = RMSNorm(d_model)
         self.attn = SelfAttention(d_model, n_heads)
-        self.ln2 = RMSNorm(d_model)
+        self.rmsnorm2 = RMSNorm(d_model)
         self.ffn = FeedForward(d_model, d_ff)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = x + self.attn(self.ln1(x))
-        x = x + self.ffn(self.ln2(x))
+        x = x + self.attn(self.rmsnorm1(x))
+        x = x + self.ffn(self.rmsnorm2(x))
         return x
 
 
@@ -116,7 +116,7 @@ class ChessTransformer(nn.Module):
             for _ in range(n_layers)
         ])
 
-        self.ln_final = RMSNorm(d_model)
+        self.rmsnorm_final = RMSNorm(d_model)
         self.move_head = nn.Linear(d_model, NUM_MOVE_CLASSES)
         self.promo_head = nn.Linear(d_model, NUM_PROMO_CLASSES)
 
@@ -140,7 +140,7 @@ class ChessTransformer(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        cls = self.ln_final(x[:, 0])
+        cls = self.rmsnorm_final(x[:, 0])
 
         return {
             'move_logits': self.move_head(cls),
@@ -150,15 +150,3 @@ class ChessTransformer(nn.Module):
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-
-def create_model(size: str = 'small', **kwargs) -> ChessTransformer:
-    """Create model with preset sizes: tiny, small, medium, large."""
-    presets = {
-        'tiny': {'d_model': 128, 'n_heads': 4, 'n_layers': 4, 'd_ff': 512},
-        'small': {'d_model': 256, 'n_heads': 8, 'n_layers': 6, 'd_ff': 1024},
-        'medium': {'d_model': 512, 'n_heads': 8, 'n_layers': 8, 'd_ff': 2048},
-        'large': {'d_model': 768, 'n_heads': 12, 'n_layers': 12, 'd_ff': 3072},
-    }
-    if size not in presets:
-        raise ValueError(f"Unknown size '{size}'. Choose from: {list(presets.keys())}")
-    return ChessTransformer(**{**presets[size], **kwargs})

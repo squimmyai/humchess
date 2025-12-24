@@ -12,6 +12,7 @@ Usage:
 import argparse
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -20,10 +21,10 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import yaml
 
 from .data.pgn_dataset import PGNDataset, collate_fn
-from .data.vocabulary import NUM_MOVE_CLASSES, NUM_PROMO_CLASSES
-from .model.transformer import ChessTransformer, create_model
+from .model.transformer import ChessTransformer
 
 
 def setup_distributed():
@@ -70,11 +71,33 @@ def masked_cross_entropy(
     return nn.functional.cross_entropy(masked_logits, targets)
 
 
+def load_model_config(path: Path) -> dict:
+    """Load model config from YAML file."""
+    with path.open('r') as f:
+        data = yaml.safe_load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError("Model config must be a YAML mapping.")
+
+    model_cfg = data.get('model', data)
+    if not isinstance(model_cfg, dict):
+        raise ValueError("Model config 'model' must be a YAML mapping.")
+
+    required = ['d_model', 'n_heads', 'n_layers', 'd_ff']
+    missing = [key for key in required if key not in model_cfg]
+    if missing:
+        raise ValueError(f"Model config missing keys: {missing}")
+
+    return {key: int(model_cfg[key]) for key in required}
+
+
 def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    precision: str,
+    scaler: torch.cuda.amp.GradScaler | None,
     rank: int = 0,
     log_interval: int = 100,
 ) -> dict:
@@ -99,29 +122,42 @@ def train_epoch(
         is_promotion = batch['is_promotion'].to(device)
 
         # Forward pass
-        outputs = model(tokens)
-        move_logits = outputs['move_logits']
-        promo_logits = outputs['promo_logits']
+        if precision == 'bf16':
+            autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        elif precision == 'fp16':
+            autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
+        else:
+            autocast_ctx = nullcontext()
 
-        # Move loss (always computed)
-        move_loss = masked_cross_entropy(move_logits, move_targets, legal_mask)
+        with autocast_ctx:
+            outputs = model(tokens)
+            move_logits = outputs['move_logits']
+            promo_logits = outputs['promo_logits']
 
-        # Promotion loss (only for promotion moves)
-        promo_loss = torch.tensor(0.0, device=device)
-        if is_promotion.any():
-            promo_mask = is_promotion
-            promo_loss = nn.functional.cross_entropy(
-                promo_logits[promo_mask],
-                promo_targets[promo_mask],
-            )
+            # Move loss (always computed)
+            move_loss = masked_cross_entropy(move_logits, move_targets, legal_mask)
 
-        # Total loss
-        loss = move_loss + promo_loss
+            # Promotion loss (only for promotion moves)
+            promo_loss = torch.tensor(0.0, device=device)
+            if is_promotion.any():
+                promo_mask = is_promotion
+                promo_loss = nn.functional.cross_entropy(
+                    promo_logits[promo_mask],
+                    promo_targets[promo_mask],
+                )
+
+            # Total loss
+            loss = move_loss + promo_loss
 
         # Backward pass
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         # Stats
         batch_size = tokens.size(0)
@@ -173,8 +209,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train HumChess model')
     parser.add_argument('--pgn', type=str, nargs='+', required=True,
                         help='Path(s) to PGN files')
-    parser.add_argument('--model-size', type=str, default='small',
-                        choices=['tiny', 'small', 'medium', 'large'])
+    parser.add_argument('--config', type=str, default='configs/model.yml',
+                        help='Path to YAML model config')
     parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--epochs', type=int, default=1)
@@ -183,6 +219,11 @@ def main():
     parser.add_argument('--log-interval', type=int, default=100)
     parser.add_argument('--min-elo', type=int, default=0)
     parser.add_argument('--max-elo', type=int, default=4000)
+    parser.add_argument('--precision', type=str, default='bf16',
+                        choices=['bf16', 'fp16', 'fp32'],
+                        help='Training precision')
+    parser.add_argument('--tf32', action='store_true',
+                        help='Enable TF32 matmul on CUDA')
     args = parser.parse_args()
 
     # Setup distributed
@@ -191,17 +232,29 @@ def main():
 
     if rank == 0:
         print(f"Training with {world_size} GPU(s)")
-        print(f"Model size: {args.model_size}")
         print(f"Batch size: {args.batch_size} (per GPU)")
         print(f"Learning rate: {args.lr}")
         print(f"PGN files: {args.pgn}")
+        print(f"Precision: {args.precision}")
+        print(f"TF32: {args.tf32}")
 
     # Create model
-    model = create_model(args.model_size)
+    config_path = Path(args.config)
+    model_cfg = load_model_config(config_path)
+    model = ChessTransformer(**model_cfg)
     model = model.to(device)
 
     if rank == 0:
+        print(f"Model config: {config_path}")
+        print(f"Model params: {model_cfg}")
         print(f"Model parameters: {model.count_parameters():,}")
+
+    if device.type == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = args.tf32
+
+    scaler = None
+    if args.precision == 'fp16' and device.type == 'cuda':
+        scaler = torch.cuda.amp.GradScaler()
 
     if is_distributed:
         model = DDP(model, device_ids=[local_rank])
@@ -240,6 +293,8 @@ def main():
             dataloader=dataloader,
             optimizer=optimizer,
             device=device,
+            precision=args.precision,
+            scaler=scaler,
             rank=rank,
             log_interval=args.log_interval,
         )

@@ -9,7 +9,6 @@ from humchess.model.transformer import (
     FeedForward,
     TransformerBlock,
     ChessTransformer,
-    create_model,
 )
 from humchess.data.tokenization import (
     VOCAB_SIZE,
@@ -17,6 +16,19 @@ from humchess.data.tokenization import (
     NUM_MOVE_CLASSES,
     NUM_PROMO_CLASSES,
 )
+
+
+def create_model(size: str = 'small', **kwargs) -> ChessTransformer:
+    """Create model with preset sizes: tiny, small, medium, large."""
+    presets = {
+        'tiny': {'d_model': 128, 'n_heads': 4, 'n_layers': 4, 'd_ff': 512},
+        'small': {'d_model': 256, 'n_heads': 8, 'n_layers': 6, 'd_ff': 1024},
+        'medium': {'d_model': 512, 'n_heads': 8, 'n_layers': 8, 'd_ff': 2048},
+        'large': {'d_model': 768, 'n_heads': 12, 'n_layers': 12, 'd_ff': 3072},
+    }
+    if size not in presets:
+        raise ValueError(f"Unknown size '{size}'. Choose from: {list(presets.keys())}")
+    return ChessTransformer(**{**presets[size], **kwargs})
 
 
 class TestRMSNorm:
