@@ -3,13 +3,14 @@ Training script with DDP support.
 
 Usage:
     Single GPU:
-        python -m humchess.train --pgn data/*.pgn
+        python -m humchess.train --config configs/model.yml
 
     Multi-GPU:
-        torchrun --nproc_per_node=4 -m humchess.train --pgn data/*.pgn
+        torchrun --nproc_per_node=4 -m humchess.train --config configs/model.yml
 """
 
 import argparse
+import glob
 import os
 import time
 from contextlib import nullcontext
@@ -71,24 +72,39 @@ def masked_cross_entropy(
     return nn.functional.cross_entropy(masked_logits, targets)
 
 
-def load_model_config(path: Path) -> dict:
-    """Load model config from YAML file."""
+def load_config(path: Path) -> dict:
+    """Load full config from YAML file."""
     with path.open('r') as f:
         data = yaml.safe_load(f)
 
     if not isinstance(data, dict):
-        raise ValueError("Model config must be a YAML mapping.")
+        raise ValueError("Config must be a YAML mapping.")
 
-    model_cfg = data.get('model', data)
+    # Validate model config
+    model_cfg = data.get('model', {})
     if not isinstance(model_cfg, dict):
-        raise ValueError("Model config 'model' must be a YAML mapping.")
+        raise ValueError("Config 'model' must be a YAML mapping.")
 
     required = ['d_model', 'n_heads', 'n_layers', 'd_ff']
     missing = [key for key in required if key not in model_cfg]
     if missing:
         raise ValueError(f"Model config missing keys: {missing}")
 
-    return {key: int(model_cfg[key]) for key in required}
+    return data
+
+
+def expand_globs(patterns: list[str]) -> list[Path]:
+    """Expand glob patterns and directories to file paths."""
+    paths = []
+    for pattern in patterns:
+        p = Path(pattern)
+        if p.is_dir():
+            paths.extend(sorted(p.glob("*.parquet")))
+        elif '*' in pattern or '?' in pattern:
+            paths.extend(sorted(Path(m) for m in glob.glob(pattern)))
+        else:
+            paths.append(p)
+    return paths
 
 
 def train_epoch(
@@ -207,101 +223,120 @@ def train_epoch(
 
 def main():
     parser = argparse.ArgumentParser(description='Train HumChess model')
-    parser.add_argument('--pgn', type=str, nargs='+', required=True,
-                        help='Path(s) to PGN files')
-    parser.add_argument('--parquet', type=str, nargs='+',
-                        help='Path(s) to Parquet shards')
     parser.add_argument('--config', type=str, default='configs/model.yml',
-                        help='Path to YAML model config')
-    parser.add_argument('--batch-size', type=int, default=256)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--epochs', type=int, default=1)
-    parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
-    parser.add_argument('--log-interval', type=int, default=100)
-    parser.add_argument('--min-elo', type=int, default=0)
-    parser.add_argument('--max-elo', type=int, default=4000)
-    parser.add_argument('--precision', type=str, default='bf16',
-                        choices=['bf16', 'fp16', 'fp32'],
-                        help='Training precision')
+                        help='Path to YAML config file')
+    # CLI overrides (optional)
+    parser.add_argument('--batch-size', type=int, help='Override batch size')
+    parser.add_argument('--lr', type=float, help='Override learning rate')
+    parser.add_argument('--epochs', type=int, help='Override epochs')
+    parser.add_argument('--num-workers', type=int, help='Override num workers')
+    parser.add_argument('--checkpoint-dir', type=str, help='Override checkpoint dir')
+    parser.add_argument('--precision', type=str, choices=['bf16', 'fp16', 'fp32'],
+                        help='Override training precision')
     parser.add_argument('--tf32', action='store_true',
                         help='Enable TF32 matmul on CUDA')
     args = parser.parse_args()
+
+    # Load config
+    config_path = Path(args.config)
+    config = load_config(config_path)
+
+    # Extract sections with defaults
+    model_cfg = config.get('model', {})
+    data_cfg = config.get('data', {})
+    train_cfg = config.get('training', {})
+
+    # Apply CLI overrides
+    batch_size = args.batch_size or train_cfg.get('batch_size', 256)
+    lr = args.lr or train_cfg.get('lr', 1e-4)
+    epochs = args.epochs or train_cfg.get('epochs', 1)
+    num_workers = args.num_workers or train_cfg.get('num_workers', 4)
+    checkpoint_dir = Path(args.checkpoint_dir or train_cfg.get('checkpoint_dir', 'checkpoints'))
+    precision = args.precision or train_cfg.get('precision', 'bf16')
+    log_interval = train_cfg.get('log_interval', 100)
 
     # Setup distributed
     rank, world_size, local_rank, is_distributed = setup_distributed()
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
 
     if rank == 0:
+        print(f"Config: {config_path}")
         print(f"Training with {world_size} GPU(s)")
-        print(f"Batch size: {args.batch_size} (per GPU)")
-        print(f"Learning rate: {args.lr}")
-        print(f"PGN files: {args.pgn}")
-        print(f"Precision: {args.precision}")
+        print(f"Batch size: {batch_size} (per GPU)")
+        print(f"Learning rate: {lr}")
+        print(f"Precision: {precision}")
         print(f"TF32: {args.tf32}")
 
     # Create model
-    config_path = Path(args.config)
-    model_cfg = load_model_config(config_path)
-    model = ChessTransformer(**model_cfg)
+    model_params = {key: int(model_cfg[key]) for key in ['d_model', 'n_heads', 'n_layers', 'd_ff']}
+    model = ChessTransformer(**model_params)
     model = model.to(device)
 
     if rank == 0:
-        print(f"Model config: {config_path}")
-        print(f"Model params: {model_cfg}")
+        print(f"Model params: {model_params}")
         print(f"Model parameters: {model.count_parameters():,}")
 
     if device.type == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = args.tf32
 
     scaler = None
-    if args.precision == 'fp16' and device.type == 'cuda':
+    if precision == 'fp16' and device.type == 'cuda':
         scaler = torch.cuda.amp.GradScaler()
 
     if is_distributed:
         model = DDP(model, device_ids=[local_rank])
 
     # Create dataset
-    if args.parquet:
-        dataset = PGNDataset.from_parquet(parquet_paths=args.parquet)
-    else:
+    parquet_patterns = data_cfg.get('parquet', [])
+    pgn_patterns = data_cfg.get('pgn', [])
+
+    if parquet_patterns:
+        parquet_paths = expand_globs(parquet_patterns)
+        if rank == 0:
+            print(f"Parquet files: {len(parquet_paths)} shards")
+        dataset = PGNDataset.from_parquet(parquet_paths=parquet_paths)
+    elif pgn_patterns:
+        pgn_paths = expand_globs(pgn_patterns)
+        if rank == 0:
+            print(f"PGN files: {pgn_paths}")
         dataset = PGNDataset(
-            pgn_paths=args.pgn,
-            min_elo=args.min_elo,
-            max_elo=args.max_elo,
+            pgn_paths=pgn_paths,
+            min_elo=data_cfg.get('min_elo', 0),
+            max_elo=data_cfg.get('max_elo', 4000),
         )
+    else:
+        raise ValueError("Config must specify data.parquet or data.pgn")
 
     # Create dataloader
     # Note: IterableDataset doesn't use sampler in the traditional sense
     # Workers handle sharding internally via get_worker_info()
     dataloader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
+        batch_size=batch_size,
+        num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
     )
 
     # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
     # Training loop
-    checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(exist_ok=True)
+    checkpoint_dir.mkdir(exist_ok=True, parents=True)
 
-    for epoch in range(args.epochs):
+    for epoch in range(epochs):
         if rank == 0:
-            print(f"\nEpoch {epoch + 1}/{args.epochs}")
+            print(f"\nEpoch {epoch + 1}/{epochs}")
 
         stats = train_epoch(
             model=model,
             dataloader=dataloader,
             optimizer=optimizer,
             device=device,
-            precision=args.precision,
+            precision=precision,
             scaler=scaler,
             rank=rank,
-            log_interval=args.log_interval,
+            log_interval=log_interval,
         )
 
         if rank == 0:
