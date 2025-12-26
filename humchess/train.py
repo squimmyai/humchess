@@ -209,6 +209,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train HumChess model')
     parser.add_argument('--pgn', type=str, nargs='+', required=True,
                         help='Path(s) to PGN files')
+    parser.add_argument('--parquet', type=str, nargs='+',
+                        help='Path(s) to Parquet shards')
     parser.add_argument('--config', type=str, default='configs/model.yml',
                         help='Path to YAML model config')
     parser.add_argument('--batch-size', type=int, default=256)
@@ -260,11 +262,14 @@ def main():
         model = DDP(model, device_ids=[local_rank])
 
     # Create dataset
-    dataset = PGNDataset(
-        pgn_paths=args.pgn,
-        min_elo=args.min_elo,
-        max_elo=args.max_elo,
-    )
+    if args.parquet:
+        dataset = PGNDataset.from_parquet(parquet_paths=args.parquet)
+    else:
+        dataset = PGNDataset(
+            pgn_paths=args.pgn,
+            min_elo=args.min_elo,
+            max_elo=args.max_elo,
+        )
 
     # Create dataloader
     # Note: IterableDataset doesn't use sampler in the traditional sense
