@@ -24,6 +24,12 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import yaml
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 from .data.pgn_dataset import PGNDataset, collate_fn
 from .model.transformer import ChessTransformer
 
@@ -107,6 +113,15 @@ def expand_globs(patterns: list[str]) -> list[Path]:
     return paths
 
 
+def count_parquet_samples(paths: list[Path]) -> int:
+    """Count total samples across parquet files using metadata (fast)."""
+    import pyarrow.parquet as pq
+    total = 0
+    for p in paths:
+        total += pq.ParquetFile(p).metadata.num_rows
+    return total
+
+
 def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -116,6 +131,8 @@ def train_epoch(
     scaler: torch.cuda.amp.GradScaler | None,
     rank: int = 0,
     log_interval: int = 100,
+    total_dataset_samples: int | None = None,
+    use_wandb: bool = False,
 ) -> dict:
     """Train for one epoch."""
     model.train()
@@ -129,6 +146,8 @@ def train_epoch(
     total_promo_correct = 0
 
     start_time = time.time()
+
+    seen = 0  # add before the dataloader loop
 
     for batch_idx, batch in enumerate(dataloader):
         tokens = batch['tokens'].to(device)
@@ -144,6 +163,16 @@ def train_epoch(
             autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
         else:
             autocast_ctx = nullcontext()
+
+        with torch.no_grad():
+            target_is_legal = legal_mask.gather(1, move_targets.unsqueeze(1)).squeeze(1)
+            illegal_target = ~target_is_legal
+            bad_idx = torch.where(illegal_target)[0]
+
+            if bad_idx.numel() > 0 and rank == 0:
+                for i in bad_idx[:10].tolist():
+                    sample_num = seen + i
+                    print(f"[illegal_target] batch={batch_idx} in_batch={i} sample_num={sample_num}")
 
         with autocast_ctx:
             outputs = model(tokens)
@@ -203,9 +232,38 @@ def train_epoch(
             avg_loss = total_loss / total_samples
             move_acc = total_correct / total_samples * 100
 
+            progress_str = ""
+            if total_dataset_samples:
+                pct = total_samples / total_dataset_samples * 100
+                remaining = total_dataset_samples - total_samples
+                eta_sec = remaining / samples_per_sec if samples_per_sec > 0 else 0
+                eta_min = eta_sec / 60
+                if eta_min >= 60:
+                    eta_str = f"{eta_min/60:.1f}h"
+                else:
+                    eta_str = f"{eta_min:.1f}m"
+                progress_str = f" | {total_samples:,}/{total_dataset_samples:,} ({pct:.1f}%) ETA {eta_str}"
+
             print(f"  Batch {batch_idx + 1}: loss={avg_loss:.4f}, "
                   f"move_acc={move_acc:.1f}%, "
-                  f"speed={samples_per_sec:.0f} samples/s")
+                  f"speed={samples_per_sec:.0f} samples/s{progress_str}")
+
+            if use_wandb:
+                log_dict = {
+                    'train/loss': avg_loss,
+                    'train/move_loss': total_move_loss / total_samples,
+                    'train/move_accuracy': total_correct / total_samples,
+                    'train/samples_per_sec': samples_per_sec,
+                    'train/samples': total_samples,
+                }
+                if total_dataset_samples:
+                    log_dict['train/progress_pct'] = total_samples / total_dataset_samples * 100
+                if total_promo_samples > 0:
+                    log_dict['train/promo_loss'] = total_promo_loss / total_promo_samples
+                    log_dict['train/promo_accuracy'] = total_promo_correct / total_promo_samples
+                wandb.log(log_dict)
+
+        seen += tokens.size(0)  # update at end of loop
 
     # Final stats
     stats = {
@@ -235,6 +293,12 @@ def main():
                         help='Override training precision')
     parser.add_argument('--tf32', action='store_true',
                         help='Enable TF32 matmul on CUDA')
+    parser.add_argument('--wandb', action='store_true',
+                        help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb-project', type=str, default='humchess',
+                        help='W&B project name')
+    parser.add_argument('--wandb-run-name', type=str, default=None,
+                        help='W&B run name (auto-generated if not set)')
     args = parser.parse_args()
 
     # Load config
@@ -248,7 +312,7 @@ def main():
 
     # Apply CLI overrides
     batch_size = args.batch_size or train_cfg.get('batch_size', 256)
-    lr = args.lr or train_cfg.get('lr', 1e-4)
+    lr = args.lr or float(train_cfg.get('lr', 1e-4))
     epochs = args.epochs or train_cfg.get('epochs', 1)
     num_workers = args.num_workers or train_cfg.get('num_workers', 4)
     checkpoint_dir = Path(args.checkpoint_dir or train_cfg.get('checkpoint_dir', 'checkpoints'))
@@ -276,6 +340,30 @@ def main():
         print(f"Model params: {model_params}")
         print(f"Model parameters: {model.count_parameters():,}")
 
+    # Initialize wandb
+    use_wandb = args.wandb and rank == 0
+    if use_wandb:
+        if not WANDB_AVAILABLE:
+            print("Warning: --wandb specified but wandb not installed. Run: pip install wandb")
+            use_wandb = False
+        else:
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                config={
+                    'model': model_params,
+                    'model_parameters': model.count_parameters(),
+                    'batch_size': batch_size,
+                    'learning_rate': lr,
+                    'epochs': epochs,
+                    'precision': precision,
+                    'tf32': args.tf32,
+                    'num_workers': num_workers,
+                    'world_size': world_size,
+                },
+            )
+            print(f"W&B run: {wandb.run.url}")
+
     if device.type == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = args.tf32
 
@@ -284,16 +372,22 @@ def main():
         scaler = torch.cuda.amp.GradScaler()
 
     if is_distributed:
-        model = DDP(model, device_ids=[local_rank])
+        # find_unused_parameters=True needed because promo_head is unused
+        # when batch has no promotions
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     # Create dataset
     parquet_patterns = data_cfg.get('parquet', [])
     pgn_patterns = data_cfg.get('pgn', [])
 
+    total_dataset_samples = None
     if parquet_patterns:
         parquet_paths = expand_globs(parquet_patterns)
         if rank == 0:
             print(f"Parquet files: {len(parquet_paths)} shards")
+            print("Counting samples...")
+            total_dataset_samples = count_parquet_samples(parquet_paths)
+            print(f"Total samples: {total_dataset_samples:,}")
         dataset = PGNDataset.from_parquet(parquet_paths=parquet_paths)
     elif pgn_patterns:
         pgn_paths = expand_globs(pgn_patterns)
@@ -337,6 +431,8 @@ def main():
             scaler=scaler,
             rank=rank,
             log_interval=log_interval,
+            total_dataset_samples=total_dataset_samples,
+            use_wandb=use_wandb,
         )
 
         if rank == 0:
@@ -345,6 +441,16 @@ def main():
             print(f"  Move accuracy: {stats['move_accuracy']*100:.1f}%")
             if 'promo_accuracy' in stats:
                 print(f"  Promo accuracy: {stats['promo_accuracy']*100:.1f}%")
+
+            if use_wandb:
+                epoch_log = {
+                    'epoch': epoch + 1,
+                    'epoch/loss': stats['loss'],
+                    'epoch/move_accuracy': stats['move_accuracy'],
+                }
+                if 'promo_accuracy' in stats:
+                    epoch_log['epoch/promo_accuracy'] = stats['promo_accuracy']
+                wandb.log(epoch_log)
 
             # Save checkpoint
             checkpoint_path = checkpoint_dir / f'epoch_{epoch + 1}.pt'
@@ -358,6 +464,9 @@ def main():
             print(f"  Saved checkpoint: {checkpoint_path}")
 
     cleanup_distributed()
+
+    if use_wandb:
+        wandb.finish()
 
     if rank == 0:
         print("\nTraining complete!")

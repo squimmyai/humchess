@@ -172,6 +172,7 @@ class PGNDataset(IterableDataset):
 
         for path in paths:
             parquet_file = pq.ParquetFile(path)
+            print(f"Worker {worker_info.id if worker_info else 0} reading Parquet file: {path}")
             for batch in parquet_file.iter_batches():
                 tokens_col = batch.column(batch.schema.get_field_index("tokens"))
                 move_col = batch.column(batch.schema.get_field_index("move_id"))
@@ -202,6 +203,7 @@ class PGNDataset(IterableDataset):
                 index = self._load_pgn_index(path)
             except FileNotFoundError:
                 index = None
+                raise
 
             if index is not None:
                 offsets = index["offsets"]
@@ -344,7 +346,9 @@ class PGNDataset(IterableDataset):
             # Create legality mask (using normalized position)
             # We need to recreate the board for the normalized position
             # For simplicity, we use the original board's legal moves and transform them
-            cache_key = tuple(tokens[1:66])
+            # Include EP square in cache key - same pieces can have different legal moves
+            # depending on whether en passant is available
+            cache_key = (tuple(tokens[1:66]), board.ep_square)
             legal_mask = self._legal_mask_cache.get(cache_key)
             if legal_mask is None:
                 legal_move_ids = self._get_normalized_legal_moves(board, is_black)
