@@ -9,11 +9,14 @@ from humchess.data.tokenization import (
     SEQ_LENGTH,
     NUM_MOVE_CLASSES,
     NUM_PROMO_CLASSES,
+    NUM_HISTORY_PLIES,
+    NO_MOVE_ID,
     Piece,
     Special,
     fen_to_tokens,
     board_to_tokens,
     normalize_position,
+    normalize_move_id,
     move_to_ids,
     ids_to_move,
     is_promotion_move,
@@ -32,7 +35,8 @@ class TestConstants:
         assert VOCAB_SIZE == 66
 
     def test_seq_length(self):
-        assert SEQ_LENGTH == 68  # CLS + 64 squares + castling + elo + tl
+        # CLS + 64 squares + castling + elo + tl + 6 history moves = 74
+        assert SEQ_LENGTH == 74
 
     def test_move_classes(self):
         assert NUM_MOVE_CLASSES == 4096  # 64 * 64
@@ -125,7 +129,8 @@ class TestFenToTokens:
         tokens, is_black = fen_to_tokens(fen, elo=1500, time_left_seconds=300)
 
         assert is_black is True
-        assert len(tokens) == SEQ_LENGTH
+        # fen_to_tokens returns base sequence (68 tokens), history added by dataset
+        assert len(tokens) == 68  # CLS + 64 squares + castling + elo + tl
 
 
 class TestBoardToTokens:
@@ -134,7 +139,8 @@ class TestBoardToTokens:
         board = chess.Board(fen)
         tokens, is_black = board_to_tokens(board, elo=1500, time_left_seconds=300)
 
-        assert len(tokens) == SEQ_LENGTH
+        # board_to_tokens returns base sequence (68 tokens), history added by dataset
+        assert len(tokens) == 68
         assert is_black is False
         assert tokens[0] == Special.CLS
         # A1 = white rook
@@ -437,7 +443,8 @@ class TestRealGameTokenization:
             # Should not raise
             tokens, is_black = fen_to_tokens(fen, elo=elo, time_left_seconds=180)
 
-            assert len(tokens) == SEQ_LENGTH
+            # fen_to_tokens returns 68 tokens (base sequence without history)
+            assert len(tokens) == 68
             assert is_black == (not is_white_turn)
 
             # Normalize and encode the move
@@ -475,3 +482,69 @@ class TestRealGameTokenization:
             # Denormalize should get back original
             recovered = denormalize_move(norm_move, was_black_to_move=is_black)
             assert recovered == original_move, f"Roundtrip failed at ply {ply}"
+
+
+# =============================================================================
+# Move history tests
+# =============================================================================
+
+
+class TestMoveHistoryConstants:
+    """Test move history-related constants."""
+
+    def test_num_history_plies(self):
+        assert NUM_HISTORY_PLIES == 6
+
+    def test_no_move_id(self):
+        # Should be 4096 (outside valid move range 0-4095)
+        assert NO_MOVE_ID == 4096
+
+
+class TestNormalizeMoveId:
+    """Test move ID normalization for history."""
+
+    def test_white_to_move_no_change(self):
+        # e2e4 move: from=12, to=28 -> move_id = 12*64 + 28 = 796
+        move_id = 12 * 64 + 28
+        result = normalize_move_id(move_id, is_black_to_move=False)
+        assert result == move_id
+
+    def test_black_to_move_rotates_180(self):
+        # e2e4 move: from=12, to=28
+        # After 180° rotation: from=63-12=51, to=63-28=35 -> 51*64 + 35 = 3299
+        move_id = 12 * 64 + 28
+        result = normalize_move_id(move_id, is_black_to_move=True)
+        expected = (63 - 12) * 64 + (63 - 28)
+        assert result == expected
+
+    def test_no_move_id_unchanged(self):
+        # Padding token should not be modified
+        result = normalize_move_id(NO_MOVE_ID, is_black_to_move=True)
+        assert result == NO_MOVE_ID
+        result = normalize_move_id(NO_MOVE_ID, is_black_to_move=False)
+        assert result == NO_MOVE_ID
+
+    def test_double_rotation_is_identity(self):
+        # Rotating twice should give back the original
+        move_id = 15 * 64 + 47  # arbitrary move
+        rotated = normalize_move_id(move_id, is_black_to_move=True)
+        # Rotating again as black should undo
+        double_rotated = normalize_move_id(rotated, is_black_to_move=True)
+        assert double_rotated == move_id
+
+    def test_corner_to_corner_rotation(self):
+        # a1a8 (0 -> 56): after rotation becomes h8h1 (63 -> 7) = 63*64 + 7 = 4039
+        move_id = 0 * 64 + 56
+        result = normalize_move_id(move_id, is_black_to_move=True)
+        assert result == 63 * 64 + 7
+
+
+class TestMoveHistoryIntegration:
+    """Integration tests for move history in the dataset."""
+
+    def test_history_length(self):
+        """Verify the full sequence has 74 tokens (68 base + 6 history)."""
+        assert SEQ_LENGTH == 74
+        # Base sequence without history
+        base_length = 68  # CLS + 64 squares + castling + elo + tl
+        assert SEQ_LENGTH == base_length + NUM_HISTORY_PLIES

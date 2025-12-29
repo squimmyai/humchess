@@ -53,7 +53,7 @@ class TestRMSNorm:
 class TestSelfAttention:
     def test_output_shape(self):
         attn = SelfAttention(d_model=256, n_heads=8)
-        x = torch.randn(2, 68, 256)
+        x = torch.randn(2, SEQ_LENGTH, 256)
         out = attn(x)
 
         assert out.shape == x.shape
@@ -68,7 +68,7 @@ class TestSelfAttention:
 class TestFeedForward:
     def test_output_shape(self):
         ffn = FeedForward(d_model=256, d_ff=1024)
-        x = torch.randn(2, 68, 256)
+        x = torch.randn(2, SEQ_LENGTH, 256)
         out = ffn(x)
 
         assert out.shape == x.shape
@@ -83,14 +83,14 @@ class TestFeedForward:
 class TestTransformerBlock:
     def test_output_shape(self):
         block = TransformerBlock(d_model=256, n_heads=8, d_ff=1024)
-        x = torch.randn(2, 68, 256)
+        x = torch.randn(2, SEQ_LENGTH, 256)
         out = block(x)
 
         assert out.shape == x.shape
 
     def test_residual_connection(self):
         block = TransformerBlock(d_model=256, n_heads=8, d_ff=1024)
-        x = torch.randn(2, 68, 256)
+        x = torch.randn(2, SEQ_LENGTH, 256)
 
         # With residual connections, output should not be zero even if
         # submodules output zero (which they won't, but conceptually)
