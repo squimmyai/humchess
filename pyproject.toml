@@ -5,13 +5,22 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "numpy>=2.1.0",
+    "pyarrow>=18.1.0",
     "python-chess>=1.999",
     "torch>=2.9.1",
     "PyYAML>=6.0.2",
     "zstandard>=0.25.0",
+    "ipywidgets>=8.1.8",
+    "wandb>=0.23.1",
+    "onnx>=1.20.0",
+    "onnxruntime>=1.23.2",
+    "onnxscript>=0.5.7",
 ]
 
 [dependency-groups]
 dev = [
+    "ipdb>=0.13.13",
+    "ipykernel>=7.1.0",
     "pytest>=9.0.2",
 ]

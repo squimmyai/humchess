@@ -3,10 +3,10 @@ Training script with DDP support.
 
 Usage:
     Single GPU:
-        python -m humchess.train --config configs/model.yml
+        uv run python -m humchess.train --config configs/model.yml
 
     Multi-GPU:
-        torchrun --nproc_per_node=4 -m humchess.train --config configs/model.yml
+        uv run torchrun --nproc_per_node=4 -m humchess.train --config configs/model.yml
 """
 
 import argparse
@@ -147,7 +147,7 @@ def train_epoch(
 
     start_time = time.time()
 
-    seen = 0  # add before the dataloader loop
+    seen = 0  # for debug logging
 
     for batch_idx, batch in enumerate(dataloader):
         tokens = batch['tokens'].to(device)
@@ -263,7 +263,7 @@ def train_epoch(
                     log_dict['train/promo_accuracy'] = total_promo_correct / total_promo_samples
                 wandb.log(log_dict)
 
-        seen += tokens.size(0)  # update at end of loop
+        seen += tokens.size(0)  # for debug logging
 
     # Final stats
     stats = {
@@ -299,6 +299,8 @@ def main():
                         help='W&B project name')
     parser.add_argument('--wandb-run-name', type=str, default=None,
                         help='W&B run name (auto-generated if not set)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
     args = parser.parse_args()
 
     # Load config
@@ -380,15 +382,36 @@ def main():
     parquet_patterns = data_cfg.get('parquet', [])
     pgn_patterns = data_cfg.get('pgn', [])
 
+    # Handle resume
+    resume_checkpoint = None
+    start_epoch = 0
+    if args.resume:
+        resume_path = Path(args.resume)
+        if resume_path.exists():
+            resume_checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+            start_epoch = resume_checkpoint.get('epoch', 0)
+            if rank == 0:
+                print(f"Resuming from: {resume_path}")
+                print(f"  Starting from epoch {start_epoch + 1}")
+        else:
+            if rank == 0:
+                print(f"Warning: Resume checkpoint not found: {resume_path}")
+
     total_dataset_samples = None
     if parquet_patterns:
         parquet_paths = expand_globs(parquet_patterns)
         if rank == 0:
             print(f"Parquet files: {len(parquet_paths)} shards")
             print("Counting samples...")
-            total_dataset_samples = count_parquet_samples(parquet_paths)
-            print(f"Total samples: {total_dataset_samples:,}")
-        dataset = PGNDataset.from_parquet(parquet_paths=parquet_paths)
+            total_samples_all_ranks = count_parquet_samples(parquet_paths)
+            # Each rank sees ~1/world_size of the samples
+            total_dataset_samples = total_samples_all_ranks // world_size
+            print(f"Total samples: {total_samples_all_ranks:,} ({total_dataset_samples:,} per rank)")
+        dataset = PGNDataset.from_parquet(
+            parquet_paths=parquet_paths,
+            rank=rank,
+            world_size=world_size,
+        )
     elif pgn_patterns:
         pgn_paths = expand_globs(pgn_patterns)
         if rank == 0:
@@ -415,10 +438,18 @@ def main():
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
+    # Load model/optimizer state if resuming
+    if resume_checkpoint:
+        model_to_load = model.module if is_distributed else model
+        model_to_load.load_state_dict(resume_checkpoint['model_state_dict'])
+        optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
+        if rank == 0:
+            print("Loaded model and optimizer state from checkpoint")
+
     # Training loop
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         if rank == 0:
             print(f"\nEpoch {epoch + 1}/{epochs}")
 
@@ -452,11 +483,12 @@ def main():
                     epoch_log['epoch/promo_accuracy'] = stats['promo_accuracy']
                 wandb.log(epoch_log)
 
-            # Save checkpoint
+            # Save end-of-epoch checkpoint
+            # epoch is 0-based, so epoch+1 marks "completed epoch 1, ready for epoch 2"
             checkpoint_path = checkpoint_dir / f'epoch_{epoch + 1}.pt'
             model_to_save = model.module if is_distributed else model
             torch.save({
-                'epoch': epoch + 1,
+                'epoch': epoch + 1,  # Next epoch to start from
                 'model_state_dict': model_to_save.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'stats': stats,

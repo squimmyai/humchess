@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HumChess - Human-Like Chess AI</title>
+    <link rel="stylesheet" href="css/style.css">
+    <!-- Chessboard.js CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>HumChess</h1>
+            <p class="subtitle">Human-like chess AI powered by ONNX Runtime Web</p>
+        </header>
+
+        <main>
+            <div class="game-area">
+                <div class="board-container">
+                    <div id="board" style="width: 400px"></div>
+                    <div id="thinking" class="thinking-indicator" style="display: none;">
+                        <span class="spinner"></span> Thinking...
+                    </div>
+                </div>
+
+                <div class="sidebar">
+                    <div class="panel controls">
+                        <h3>Controls</h3>
+                        <div class="button-group">
+                            <button id="new-game-white">New Game (White)</button>
+                            <button id="new-game-black">New Game (Black)</button>
+                        </div>
+                        <div class="button-group">
+                            <button id="flip-board">Flip Board</button>
+                            <button id="undo-move">Undo Move</button>
+                        </div>
+                    </div>
+
+                    <div class="panel elo-control">
+                        <h3>AI Elo Rating</h3>
+                        <input type="range" id="elo-slider" min="800" max="2500" value="1500" step="100">
+                        <div class="elo-display">
+                            <span id="elo-value">1500</span>
+                        </div>
+                        <p class="hint">Lower Elo = weaker/more human-like play</p>
+                    </div>
+
+                    <div class="panel status-panel">
+                        <h3>Status</h3>
+                        <p id="status">Loading...</p>
+                    </div>
+
+                    <div class="panel" id="top-moves">
+                        <h4>AI Top Moves</h4>
+                        <p>-</p>
+                    </div>
+
+                    <div class="panel moves-panel">
+                        <h3>Moves</h3>
+                        <div id="move-list" class="move-list">
+                            <p>Game start</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <footer>
+            <p>
+                Model runs entirely in your browser using
+                <a href="https://onnxruntime.ai/docs/tutorials/web/" target="_blank">ONNX Runtime Web</a>.
+                No moves are sent to any server.
+            </p>
+        </footer>
+    </div>
+
+    <!-- Dependencies -->
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js"></script>
+
+    <!-- App -->
+    <script type="module" src="js/app.js"></script>
+</body>
+</html>

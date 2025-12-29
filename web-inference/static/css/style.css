@@ -1,0 +1,277 @@
+/* HumChess Web Interface Styles */
+
+:root {
+    --bg-color: #1a1a2e;
+    --panel-bg: #16213e;
+    --accent: #0f3460;
+    --highlight: #e94560;
+    --text: #eaeaea;
+    --text-muted: #a0a0a0;
+    --border: #2a2a4a;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    background-color: var(--bg-color);
+    color: var(--text);
+    line-height: 1.6;
+    min-height: 100vh;
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+/* Header */
+header {
+    text-align: center;
+    margin-bottom: 30px;
+}
+
+header h1 {
+    font-size: 2.5rem;
+    color: var(--highlight);
+    margin-bottom: 5px;
+}
+
+.subtitle {
+    color: var(--text-muted);
+    font-size: 1rem;
+}
+
+/* Main Game Area */
+.game-area {
+    display: flex;
+    gap: 30px;
+    justify-content: center;
+    flex-wrap: wrap;
+}
+
+.board-container {
+    position: relative;
+}
+
+#board {
+    border-radius: 4px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+/* Thinking Indicator */
+.thinking-indicator {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: rgba(0, 0, 0, 0.8);
+    padding: 15px 25px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 500;
+    z-index: 100;
+}
+
+.spinner {
+    width: 20px;
+    height: 20px;
+    border: 3px solid var(--text-muted);
+    border-top-color: var(--highlight);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+/* Sidebar */
+.sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+    width: 280px;
+}
+
+/* Panels */
+.panel {
+    background: var(--panel-bg);
+    border-radius: 8px;
+    padding: 15px;
+    border: 1px solid var(--border);
+}
+
+.panel h3, .panel h4 {
+    color: var(--highlight);
+    margin-bottom: 10px;
+    font-size: 0.95rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* Buttons */
+.button-group {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.button-group:last-child {
+    margin-bottom: 0;
+}
+
+button {
+    flex: 1;
+    padding: 10px 15px;
+    background: var(--accent);
+    color: var(--text);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    transition: background 0.2s, transform 0.1s;
+}
+
+button:hover {
+    background: #1a4a7a;
+}
+
+button:active {
+    transform: scale(0.98);
+}
+
+/* Elo Slider */
+.elo-control input[type="range"] {
+    width: 100%;
+    margin: 10px 0;
+    accent-color: var(--highlight);
+}
+
+.elo-display {
+    text-align: center;
+    font-size: 2rem;
+    font-weight: bold;
+    color: var(--highlight);
+}
+
+.hint {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    text-align: center;
+    margin-top: 5px;
+}
+
+/* Status */
+#status {
+    font-size: 1.1rem;
+    text-align: center;
+    padding: 5px;
+}
+
+/* Top Moves */
+#top-moves ul {
+    list-style: none;
+    padding: 0;
+}
+
+#top-moves li {
+    display: flex;
+    justify-content: space-between;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--border);
+}
+
+#top-moves li:last-child {
+    border-bottom: none;
+}
+
+#top-moves .prob {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+/* Move List */
+.move-list {
+    max-height: 200px;
+    overflow-y: auto;
+    font-family: monospace;
+    font-size: 0.9rem;
+}
+
+.move-row {
+    display: flex;
+    gap: 10px;
+    padding: 3px 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.move-num {
+    color: var(--text-muted);
+    min-width: 25px;
+}
+
+.white-move, .black-move {
+    min-width: 50px;
+}
+
+/* Footer */
+footer {
+    margin-top: 40px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+}
+
+footer a {
+    color: var(--highlight);
+    text-decoration: none;
+}
+
+footer a:hover {
+    text-decoration: underline;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .game-area {
+        flex-direction: column;
+        align-items: center;
+    }
+
+    .sidebar {
+        width: 100%;
+        max-width: 400px;
+    }
+
+    #board {
+        width: 100% !important;
+        max-width: 400px;
+    }
+}
+
+/* Scrollbar */
+.move-list::-webkit-scrollbar {
+    width: 8px;
+}
+
+.move-list::-webkit-scrollbar-track {
+    background: var(--bg-color);
+    border-radius: 4px;
+}
+
+.move-list::-webkit-scrollbar-thumb {
+    background: var(--accent);
+    border-radius: 4px;
+}
+
+.move-list::-webkit-scrollbar-thumb:hover {
+    background: var(--highlight);
+}

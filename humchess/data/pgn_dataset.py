@@ -106,6 +106,8 @@ class PGNDataset(IterableDataset):
         start_game: int = 0,
         end_game: Optional[int] = None,
         include_metadata: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         """
         Args:
@@ -124,13 +126,20 @@ class PGNDataset(IterableDataset):
         self.start_game = start_game
         self.end_game = end_game
         self.include_metadata = include_metadata
+        self.rank = rank
+        self.world_size = world_size
         self._legal_mask_cache: LRUCache = LRUCache(maxsize=100_000)
         self._pgn_index_cache: dict[Path, dict[str, object]] = {}
 
     @classmethod
-    def from_parquet(cls, parquet_paths: list[str | Path]) -> "PGNDataset":
+    def from_parquet(
+        cls,
+        parquet_paths: list[str | Path],
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> "PGNDataset":
         """Create a dataset that reads pre-tokenized Parquet shards."""
-        return cls(pgn_paths=None, parquet_paths=parquet_paths)
+        return cls(pgn_paths=None, parquet_paths=parquet_paths, rank=rank, world_size=world_size)
 
     def __iter__(self) -> Iterator[dict]:
         worker_info = get_worker_info()
@@ -162,11 +171,23 @@ class PGNDataset(IterableDataset):
     def _iter_parquet(self, worker_info) -> Iterator[dict]:
         import pyarrow.parquet as pq
 
-        if worker_info is None:
-            paths = self.parquet_paths
-        else:
-            paths = [
+        # Two-level sharding: by DDP rank first, then by DataLoader worker
+        # This ensures each (rank, worker) pair gets a unique subset of files
+        if self.world_size > 1:
+            # First shard by rank
+            rank_paths = [
                 p for i, p in enumerate(self.parquet_paths)
+                if i % self.world_size == self.rank
+            ]
+        else:
+            rank_paths = self.parquet_paths
+
+        if worker_info is None:
+            paths = rank_paths
+        else:
+            # Then shard by worker within this rank's files
+            paths = [
+                p for i, p in enumerate(rank_paths)
                 if i % worker_info.num_workers == worker_info.id
             ]
 
@@ -193,6 +214,7 @@ class PGNDataset(IterableDataset):
                         'promo_id': promo_id,
                         'legal_mask': legal_mask,
                         'is_promotion': is_promo,
+                        'shard_path': str(path),
                     }
                     
     def _iter_pgn(self, path: Path, worker_info, shard_by_game: bool) -> Iterator[dict]:
@@ -811,10 +833,13 @@ def collate_fn(batch: list[dict]) -> dict:
 
     Returns batched tensors.
     """
-    return {
+    result = {
         'tokens': torch.stack([item['tokens'] for item in batch]),
         'move_id': torch.tensor([item['move_id'] for item in batch], dtype=torch.long),
         'promo_id': torch.tensor([item['promo_id'] for item in batch], dtype=torch.long),
         'legal_mask': torch.stack([item['legal_mask'] for item in batch]),
         'is_promotion': torch.tensor([item['is_promotion'] for item in batch], dtype=torch.bool),
     }
+    if 'shard_path' in batch[0]:
+        result['shard_paths'] = [item['shard_path'] for item in batch]
+    return result

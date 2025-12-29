@@ -7,7 +7,7 @@ model:
 data:
   # Parquet shards - supports globs and directories
   parquet:
-    - data/tokenized/*.parquet
+    - data/tokenized/lichess_db_standard_rated_2017-04*
   # PGN files (alternative to parquet, slower)
   # pgn:
   #   - data/*.pgn
@@ -16,7 +16,7 @@ data:
 
 training:
   checkpoint_dir: checkpoints
-  batch_size: 256
+  batch_size: 768
   lr: 1e-4
   epochs: 1
   num_workers: 4
