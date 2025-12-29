@@ -14,7 +14,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..data.tokenization import VOCAB_SIZE, NUM_MOVE_CLASSES, NUM_PROMO_CLASSES
+from ..data.tokenization import (
+    VOCAB_SIZE, NUM_MOVE_CLASSES, NUM_PROMO_CLASSES, NO_MOVE_ID,
+)
 
 
 class RMSNorm(nn.Module):
@@ -93,7 +95,9 @@ class ChessTransformer(nn.Module):
     """
     Encoder-only transformer for human-like chess move prediction.
 
-    Input: token sequence of shape (batch, 68)
+    Input: token sequence of shape (batch, 74)
+           - positions 0-67: board tokens (CLS + 64 squares + castling + elo + time_left)
+           - positions 68-73: move history (6 most recent moves, normalized)
     Output: move logits (batch, 4096), promotion logits (batch, 4)
     """
 
@@ -110,6 +114,10 @@ class ChessTransformer(nn.Module):
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(64, d_model)
+        # Move history embedding: 4096 moves + 1 padding token (NO_MOVE_ID)
+        self.move_history_emb = nn.Embedding(NO_MOVE_ID + 1, d_model)
+        # History position embedding (6 slots: opponent, you, opponent, you, opponent, you)
+        self.history_pos_emb = nn.Embedding(6, d_model)
 
         self.blocks = nn.ModuleList([
             TransformerBlock(d_model, n_heads, d_ff)
@@ -134,8 +142,20 @@ class ChessTransformer(nn.Module):
                 nn.init.ones_(module.weight)
 
     def forward(self, tokens: Tensor) -> dict[str, Tensor]:
-        x = self.token_emb(tokens)
-        x[:, 1:65] = x[:, 1:65] + self.pos_emb(torch.arange(64, device=tokens.device))
+        # Split tokens: board (0-67) and history (68-73)
+        board_tokens = tokens[:, :68]
+        history_tokens = tokens[:, 68:74]
+
+        # Embed board tokens
+        board_emb = self.token_emb(board_tokens)
+        board_emb[:, 1:65] = board_emb[:, 1:65] + self.pos_emb(torch.arange(64, device=tokens.device))
+
+        # Embed move history with positional encoding
+        history_emb = self.move_history_emb(history_tokens)
+        history_emb = history_emb + self.history_pos_emb(torch.arange(6, device=tokens.device))
+
+        # Concatenate
+        x = torch.cat([board_emb, history_emb], dim=1)  # (batch, 74, d_model)
 
         for block in self.blocks:
             x = block(x)

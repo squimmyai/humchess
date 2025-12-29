@@ -37,15 +37,16 @@ Where:
 
 ### 2.2 Input Processing
 
-Input sequence: 68 tokens
+Input sequence: 74 tokens
 
 ```
-[CLS, SQ_0, SQ_1, ..., SQ_63, CASTLING, ELO_BUCKET, TL_BUCKET]
+[CLS, SQ_0, ..., SQ_63, CASTLING, ELO_BUCKET, TL_BUCKET, HIST_1, ..., HIST_6]
 ```
 
-- Token embeddings: `nn.Embedding(66, d_model)`
+- Token embeddings: `nn.Embedding(66, d_model)` for positions 0-67
+- Move history embeddings: `nn.Embedding(4097, d_model)` for positions 68-73 (4096 moves + padding)
 - Positional embeddings: `nn.Embedding(64, d_model)` added only to board squares (indices 1-64)
-- CLS and metadata tokens receive no positional embedding
+- CLS, metadata, and history tokens receive no positional embedding
 
 ### 2.3 Transformer Blocks
 
@@ -259,7 +260,7 @@ uv run python -m humchess.data.build_parquet build \
 ```
 
 Each Parquet row contains:
-- `tokens`: List[int] of length 68
+- `tokens`: List[int] of length 74 (68 board + 6 history)
 - `move_id`: int16 (0-4095)
 - `promo_id`: int8 (-1 if not promotion, 0-3 otherwise)
 - `is_promotion`: bool
@@ -278,7 +279,7 @@ This ensures each (rank, worker) pair processes unique data.
 
 ```python
 {
-    'tokens': Tensor[B, 68],      # Input token IDs
+    'tokens': Tensor[B, 74],      # Input token IDs (68 board + 6 history)
     'move_id': Tensor[B],         # Target move (0-4095)
     'promo_id': Tensor[B],        # Target promotion (-1 or 0-3)
     'legal_mask': Tensor[B, 4096], # True for legal moves
@@ -358,14 +359,15 @@ Logged during training:
 
 ## 10. Inference
 
-1. Tokenize position with Elo and time-left
+1. Tokenize position with Elo and time-left (68 tokens)
 2. Apply white normalization if black to move
-3. Forward pass through model
-4. Apply legality mask to move logits
-5. Sample move_id from masked softmax distribution
-6. If promotion (pawn to rank 8): sample promo_id from promotion head
-7. Denormalize move if originally black to move
-8. Return UCI move string
+3. Normalize and append move history (6 tokens, padded with NO_MOVE_ID if insufficient)
+4. Forward pass through model
+5. Apply legality mask to move logits
+6. Sample move_id from masked softmax distribution
+7. If promotion (pawn to rank 8): sample promo_id from promotion head
+8. Denormalize move if originally black to move
+9. Return UCI move string
 
 ---
 

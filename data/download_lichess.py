@@ -8,9 +8,10 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 from pathlib import Path
-from urllib.request import urlretrieve
+from urllib.request import urlopen
 
 import zstandard as zstd
+from tqdm import tqdm
 
 
 BASE_URL = "https://database.lichess.org/standard"
@@ -49,18 +50,32 @@ def iter_months(start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int,
 
 
 def download_file(url: str, dest: Path) -> None:
-    """Download a file to dest path."""
+    """Download a file to dest path with progress bar."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    urlretrieve(url, dest)
+    with urlopen(url) as response:
+        total_size = int(response.headers.get("Content-Length", 0))
+        with (
+            dest.open("wb") as f_out,
+            tqdm(total=total_size, unit="B", unit_scale=True, desc=dest.name) as pbar,
+        ):
+            while chunk := response.read(1024 * 1024):
+                f_out.write(chunk)
+                pbar.update(len(chunk))
 
 
 def extract_zst(src: Path, dest: Path) -> None:
-    """Extract a .zst file to dest path."""
-    with src.open("rb") as f_in, dest.open("wb") as f_out:
+    """Extract a .zst file to dest path with progress bar."""
+    src_size = src.stat().st_size
+    with (
+        src.open("rb") as f_in,
+        dest.open("wb") as f_out,
+        tqdm(total=src_size, unit="B", unit_scale=True, desc=f"Extracting {dest.name}") as pbar,
+    ):
         dctx = zstd.ZstdDecompressor()
         with dctx.stream_reader(f_in) as reader:
-            for chunk in iter(lambda: reader.read(1024 * 1024), b""):
+            while chunk := reader.read(1024 * 1024):
                 f_out.write(chunk)
+                pbar.update(f_in.tell() - pbar.n)
 
 
 def main() -> int:
@@ -92,7 +107,6 @@ def main() -> int:
         else:
             print(f"Using existing {zst_path}")
 
-        print(f"Extracting to {pgn_path}")
         extract_zst(zst_path, pgn_path)
 
         if not args.keep_zst:

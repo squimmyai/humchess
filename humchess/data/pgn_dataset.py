@@ -18,8 +18,9 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
 from .tokenization import (
-    SEQ_LENGTH, NUM_MOVE_CLASSES,
+    SEQ_LENGTH, NUM_MOVE_CLASSES, NUM_HISTORY_PLIES, NO_MOVE_ID,
     board_to_tokens, normalize_position, move_to_ids, is_promotion_move,
+    normalize_move_id,
 )
 
 
@@ -195,11 +196,12 @@ class PGNDataset(IterableDataset):
             parquet_file = pq.ParquetFile(path)
             print(f"Worker {worker_info.id if worker_info else 0} reading Parquet file: {path}")
             for batch in parquet_file.iter_batches():
-                tokens_col = batch.column(batch.schema.get_field_index("tokens"))
-                move_col = batch.column(batch.schema.get_field_index("move_id"))
-                promo_col = batch.column(batch.schema.get_field_index("promo_id"))
-                promo_flag_col = batch.column(batch.schema.get_field_index("is_promotion"))
-                mask_col = batch.column(batch.schema.get_field_index("legal_mask"))
+                schema = batch.schema
+                tokens_col = batch.column(schema.get_field_index("tokens"))
+                move_col = batch.column(schema.get_field_index("move_id"))
+                promo_col = batch.column(schema.get_field_index("promo_id"))
+                promo_flag_col = batch.column(schema.get_field_index("is_promotion"))
+                mask_col = batch.column(schema.get_field_index("legal_mask"))
 
                 for i in range(batch.num_rows):
                     tokens = torch.tensor(tokens_col[i].as_py(), dtype=torch.long)
@@ -337,12 +339,20 @@ class PGNDataset(IterableDataset):
         board = game.board()
         node = game
 
+        # Track move history (raw move IDs before normalization)
+        move_history: list[int] = []
+
         ply = 0
         for node in game.mainline():
             move = node.move
 
-            # Skip opening plies
+            # Skip opening plies (but still track history)
             if ply < self.skip_first_n_plies:
+                # Record raw move ID for history
+                raw_move_id = move.from_square * 64 + move.to_square
+                move_history.append(raw_move_id)
+                if len(move_history) > NUM_HISTORY_PLIES:
+                    move_history.pop(0)
                 board.push(move)
                 ply += 1
                 continue
@@ -361,6 +371,20 @@ class PGNDataset(IterableDataset):
 
             # Apply white normalization
             tokens, move_uci = normalize_position(tokens, move_uci, is_black)
+
+            # Build normalized history (most recent first)
+            # Pad with NO_MOVE_ID if insufficient history
+            history_ids = []
+            for i in range(NUM_HISTORY_PLIES):
+                if i < len(move_history):
+                    # Get from end of list (most recent)
+                    raw_id = move_history[-(i + 1)]
+                    history_ids.append(normalize_move_id(raw_id, is_black))
+                else:
+                    history_ids.append(NO_MOVE_ID)
+
+            # Append history to tokens (now 74 elements total)
+            tokens = tokens + history_ids
 
             # Convert move to IDs
             move_id, promo_id = move_to_ids(move_uci)
@@ -399,6 +423,12 @@ class PGNDataset(IterableDataset):
                     } if self.include_metadata else {}
                 ),
             }
+
+            # Record raw move ID for history (before advancing)
+            raw_move_id = move.from_square * 64 + move.to_square
+            move_history.append(raw_move_id)
+            if len(move_history) > NUM_HISTORY_PLIES:
+                move_history.pop(0)
 
             # Advance position
             board.push(move)

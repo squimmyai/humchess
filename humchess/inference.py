@@ -11,9 +11,9 @@ import torch
 import torch.nn.functional as F
 
 from .data.tokenization import (
-    NUM_MOVE_CLASSES,
+    NUM_MOVE_CLASSES, NUM_HISTORY_PLIES, NO_MOVE_ID,
     board_to_tokens, normalize_position, move_to_ids, ids_to_move,
-    is_promotion_move, denormalize_move,
+    is_promotion_move, denormalize_move, normalize_move_id,
 )
 from .model.transformer import ChessTransformer
 
@@ -45,12 +45,37 @@ def get_legal_move_mask(board: chess.Board, was_black: bool) -> torch.Tensor:
     return mask
 
 
+def normalize_history(
+    move_history: list[int],
+    is_black: bool,
+) -> list[int]:
+    """
+    Normalize move history for model input.
+
+    Args:
+        move_history: List of raw move IDs (from_sq * 64 + to_sq), most recent first.
+                      Can be shorter than NUM_HISTORY_PLIES.
+        is_black: Whether current position is black to move
+
+    Returns:
+        List of NUM_HISTORY_PLIES normalized move IDs, padded with NO_MOVE_ID
+    """
+    result = []
+    for i in range(NUM_HISTORY_PLIES):
+        if i < len(move_history):
+            result.append(normalize_move_id(move_history[i], is_black))
+        else:
+            result.append(NO_MOVE_ID)
+    return result
+
+
 @torch.no_grad()
 def predict_move(
     model: ChessTransformer,
     fen: str,
     elo: int,
     time_left_seconds: Optional[float] = None,
+    move_history: Optional[list[int]] = None,
     device: torch.device = None,
 ) -> str:
     """
@@ -61,6 +86,8 @@ def predict_move(
         fen: FEN string of the position
         elo: Elo rating to emulate
         time_left_seconds: Time remaining on clock (optional)
+        move_history: List of raw move IDs (from_sq * 64 + to_sq), most recent first.
+                      These are raw/unnormalized IDs from the actual game.
         device: Device to run inference on
 
     Returns:
@@ -68,6 +95,8 @@ def predict_move(
     """
     if device is None:
         device = next(model.parameters()).device
+    if move_history is None:
+        move_history = []
 
     model.eval()
 
@@ -80,6 +109,10 @@ def predict_move(
     # Create a dummy move for normalization (we'll use any legal move)
     dummy_move = list(board.legal_moves)[0].uci()
     tokens, _ = normalize_position(tokens, dummy_move, is_black)
+
+    # Normalize and append move history
+    history_normalized = normalize_history(move_history, is_black)
+    tokens = tokens + history_normalized  # Now 74 elements
 
     # Create input tensor
     tokens_tensor = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
@@ -124,6 +157,7 @@ def predict_move_distribution(
     fen: str,
     elo: int,
     time_left_seconds: Optional[float] = None,
+    move_history: Optional[list[int]] = None,
     device: torch.device = None,
     top_k: int = 5,
 ) -> list[tuple[str, float]]:
@@ -135,6 +169,8 @@ def predict_move_distribution(
         fen: FEN string of the position
         elo: Elo rating to emulate
         time_left_seconds: Time remaining on clock (optional)
+        move_history: List of raw move IDs (from_sq * 64 + to_sq), most recent first.
+                      These are raw/unnormalized IDs from the actual game.
         device: Device to run inference on
         top_k: Number of top moves to return
 
@@ -143,6 +179,8 @@ def predict_move_distribution(
     """
     if device is None:
         device = next(model.parameters()).device
+    if move_history is None:
+        move_history = []
 
     model.eval()
 
@@ -155,6 +193,10 @@ def predict_move_distribution(
     # Dummy move for normalization
     dummy_move = list(board.legal_moves)[0].uci()
     tokens, _ = normalize_position(tokens, dummy_move, is_black)
+
+    # Normalize and append move history
+    history_normalized = normalize_history(move_history, is_black)
+    tokens = tokens + history_normalized  # Now 74 elements
 
     # Create input tensor
     tokens_tensor = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)

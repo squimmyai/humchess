@@ -4,8 +4,8 @@ Human-like chess move prediction conditioned on Elo and time remaining.
 
 ## Overview
 
-- **Model**: Encoder-only transformer (RMSNorm, QK-norm, SiLU). Reads 68 tokens, outputs move logits (4096 classes) + promotion logits (4 classes).
-- **Input**: `[CLS, 64 squares, castling, elo_bucket, time_left_bucket]`
+- **Model**: Encoder-only transformer (RMSNorm, QK-norm, SiLU). Reads 74 tokens, outputs move logits (4096 classes) + promotion logits (4 classes).
+- **Input**: `[CLS, 64 squares, castling, elo_bucket, time_left_bucket, 6 history moves]`
 - **White normalization**: All positions normalized so white is to move (rotate 180° + swap colors when black to move)
 - **Legality masking**: Illegal moves set to -inf before softmax during training and inference
 - **Inference**: Sample from masked distribution (no temperature tuning)

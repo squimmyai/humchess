@@ -132,7 +132,14 @@ def tl_bucket_token(seconds: Optional[float]) -> int:
 # =============================================================================
 
 VOCAB_SIZE = TL_BUCKET_BASE + NUM_TL_BUCKETS  # 66
-SEQ_LENGTH = 1 + 64 + 1 + 1 + 1  # CLS + squares + castling + elo + tl = 68
+SEQ_LENGTH = 1 + 64 + 1 + 1 + 1 + 6  # CLS + squares + castling + elo + tl + history = 74
+
+# =============================================================================
+# Move History
+# =============================================================================
+
+NUM_HISTORY_PLIES = 6  # 3 full moves (6 half-moves)
+NO_MOVE_ID = 4096  # Padding token for positions with insufficient history
 
 
 # =============================================================================
@@ -271,6 +278,19 @@ def _normalize_move(move_uci: str) -> str:
 def denormalize_move(move_uci: str, was_black_to_move: bool) -> str:
     """Reverse move normalization. (180° rotation is self-inverse.)"""
     return _normalize_move(move_uci) if was_black_to_move else move_uci
+
+
+def normalize_move_id(move_id: int, is_black_to_move: bool) -> int:
+    """Apply 180° rotation to move ID if black to move."""
+    # If white to move, no normalization. All history stays as is.
+    if not is_black_to_move or move_id == NO_MOVE_ID:
+        return move_id
+
+    # If black to move, normalise everything so the previous move appears as black
+    # (as the black to move position is rotated).
+    from_sq = move_id // 64
+    to_sq = move_id % 64
+    return (63 - from_sq) * 64 + (63 - to_sq)
 
 
 # =============================================================================

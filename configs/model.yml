@@ -1,8 +1,8 @@
 model:
-  d_model: 256
+  d_model: 384
   n_heads: 8
-  n_layers: 6
-  d_ff: 1024
+  n_layers: 8
+  d_ff: 1536
 
 data:
   # Parquet shards - supports globs and directories
