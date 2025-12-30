@@ -14,7 +14,13 @@ from humchess.data.pgn_dataset import (
     _pack_legal_mask,
     _unpack_legal_mask,
 )
-from humchess.data.tokenization import SEQ_LENGTH, NUM_MOVE_CLASSES, NUM_HISTORY_PLIES
+from humchess.data.tokenization import (
+    SEQ_LENGTH,
+    NUM_MOVE_CLASSES,
+    NUM_HISTORY_PLIES,
+    NO_MOVE_ID,
+    normalize_move_id,
+)
 
 
 # Sample PGN with multiple games for testing
@@ -212,6 +218,63 @@ class TestParquetRoundTrip:
         history = later_sample['tokens'][68:74]
         # At least some should not be NO_MOVE_ID
         assert not all(t == 4096 for t in history.tolist())
+
+    def test_parquet_history_values_correct(self, sample_pgn_file, tmp_path):
+        """Test that history tokens contain correct move IDs from previous plies."""
+        import chess
+        import chess.pgn
+        import io
+
+        shards = write_parquet_from_pgn(
+            pgn_path=sample_pgn_file,
+            out_dir=tmp_path,
+            max_games_per_shard=10,
+        )
+
+        parquet_samples = list(PGNDataset.from_parquet(parquet_paths=shards))
+
+        # Parse the first game to get ground truth moves
+        with open(sample_pgn_file, 'r') as f:
+            game = chess.pgn.read_game(f)
+
+        board = game.board()
+        moves = list(game.mainline_moves())
+
+        # Track move history as we replay
+        move_history = []
+
+        for ply, move in enumerate(moves):
+            sample = parquet_samples[ply]
+            history_tokens = sample['tokens'][68:74].tolist()
+
+            # Determine if this position is black to move (for normalization)
+            is_black = board.turn == chess.BLACK
+
+            # Check each history slot
+            for i in range(NUM_HISTORY_PLIES):
+                expected_token = history_tokens[i]
+
+                if i < len(move_history):
+                    # Get raw move ID from history (most recent first)
+                    raw_id = move_history[-(i + 1)]
+                    # Apply normalization
+                    normalized_id = normalize_move_id(raw_id, is_black)
+                    assert expected_token == normalized_id, (
+                        f"Ply {ply}, history slot {i}: expected {normalized_id}, got {expected_token}"
+                    )
+                else:
+                    # Should be padding
+                    assert expected_token == NO_MOVE_ID, (
+                        f"Ply {ply}, history slot {i}: expected NO_MOVE_ID, got {expected_token}"
+                    )
+
+            # Add current move to history for next iteration
+            raw_move_id = move.from_square * 64 + move.to_square
+            move_history.append(raw_move_id)
+            if len(move_history) > NUM_HISTORY_PLIES:
+                move_history.pop(0)
+
+            board.push(move)
 
     def test_parquet_legal_mask_shape(self, sample_pgn_file, tmp_path):
         """Test that legal masks from parquet have correct shape."""

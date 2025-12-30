@@ -13,7 +13,13 @@ from humchess.data.pgn_dataset import (
     parse_time_control,
     parse_clock,
 )
-from humchess.data.tokenization import SEQ_LENGTH, NUM_MOVE_CLASSES
+from humchess.data.tokenization import (
+    SEQ_LENGTH,
+    NUM_MOVE_CLASSES,
+    NUM_HISTORY_PLIES,
+    NO_MOVE_ID,
+    normalize_move_id,
+)
 
 
 # Extracted from lichess_db_standard_rated_2017-04.pgn
@@ -247,3 +253,87 @@ class TestCollateFn:
         assert batch['promo_id'].dtype == torch.long
         assert batch['legal_mask'].dtype == torch.bool
         assert batch['is_promotion'].dtype == torch.bool
+
+
+class TestMoveHistory:
+    """Tests for move history tokenization in PGN streaming."""
+
+    def test_first_position_has_no_history(self, sample_pgn_file):
+        """Test that first position has all NO_MOVE_ID for history."""
+        dataset = PGNDataset(pgn_paths=[sample_pgn_file])
+        sample = next(iter(dataset))
+
+        history_tokens = sample['tokens'][68:74].tolist()
+        assert all(t == NO_MOVE_ID for t in history_tokens)
+
+    def test_history_fills_progressively(self, sample_pgn_file):
+        """Test that history fills up as game progresses."""
+        dataset = PGNDataset(pgn_paths=[sample_pgn_file])
+        samples = list(dataset)
+
+        # Ply 0: 0 history moves, 6 padding
+        assert samples[0]['tokens'][68:74].tolist().count(NO_MOVE_ID) == 6
+
+        # Ply 1: 1 history move, 5 padding
+        assert samples[1]['tokens'][68:74].tolist().count(NO_MOVE_ID) == 5
+
+        # Ply 6+: should have full 6 history moves, 0 padding
+        assert samples[6]['tokens'][68:74].tolist().count(NO_MOVE_ID) == 0
+
+    def test_history_values_match_previous_moves(self, sample_pgn_file):
+        """Test that history tokens contain correct normalized move IDs."""
+        import chess
+        import chess.pgn
+
+        dataset = PGNDataset(pgn_paths=[sample_pgn_file])
+        samples = list(dataset)
+
+        # Parse the first game to get ground truth moves
+        with open(sample_pgn_file, 'r') as f:
+            game = chess.pgn.read_game(f)
+
+        board = game.board()
+        moves = list(game.mainline_moves())
+        move_history = []
+
+        for ply, move in enumerate(moves):
+            sample = samples[ply]
+            history_tokens = sample['tokens'][68:74].tolist()
+            is_black = board.turn == chess.BLACK
+
+            # Verify each history slot
+            for i in range(NUM_HISTORY_PLIES):
+                if i < len(move_history):
+                    raw_id = move_history[-(i + 1)]
+                    expected = normalize_move_id(raw_id, is_black)
+                    assert history_tokens[i] == expected, (
+                        f"Ply {ply}, slot {i}: expected {expected}, got {history_tokens[i]}"
+                    )
+                else:
+                    assert history_tokens[i] == NO_MOVE_ID
+
+            # Update history
+            raw_move_id = move.from_square * 64 + move.to_square
+            move_history.append(raw_move_id)
+            if len(move_history) > NUM_HISTORY_PLIES:
+                move_history.pop(0)
+
+            board.push(move)
+
+    def test_history_resets_between_games(self, sample_pgn_file):
+        """Test that history resets at game boundaries."""
+        dataset = PGNDataset(pgn_paths=[sample_pgn_file], include_metadata=True)
+        samples = list(dataset)
+
+        # Find first position of second game
+        prev_game = None
+        for sample in samples:
+            game_idx = sample['meta']['game']
+            if prev_game is not None and game_idx != prev_game:
+                # This is first position of a new game
+                history_tokens = sample['tokens'][68:74].tolist()
+                assert all(t == NO_MOVE_ID for t in history_tokens), (
+                    f"Game {game_idx} first position should have empty history"
+                )
+                break
+            prev_game = game_idx
