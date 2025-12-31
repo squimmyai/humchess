@@ -364,27 +364,29 @@ def _read_index(path: Path) -> dict[str, int]:
     }
 
 
-def _is_range_covered(
-    out_dir: Path,
-    pgn_stem: str,
-    start_game: int,
-    end_game: int,
-) -> bool:
-    """Check if a game range is fully covered by existing shards."""
+def _scan_existing_shards(out_dir: Path, pgn_stem: str) -> list[tuple[int, int]]:
+    """Scan output directory once and return sorted list of (start, end) ranges."""
     import re
     pattern = re.compile(rf"^{re.escape(pgn_stem)}_games_(\d+)-(\d+)\.parquet$")
 
-    # Collect all shard ranges
     shard_ranges: list[tuple[int, int]] = []
     for p in out_dir.iterdir():
         m = pattern.match(p.name)
         if m:
             shard_ranges.append((int(m.group(1)), int(m.group(2))))
 
+    shard_ranges.sort()
+    return shard_ranges
+
+
+def _is_range_covered(
+    shard_ranges: list[tuple[int, int]],
+    start_game: int,
+    end_game: int,
+) -> bool:
+    """Check if a game range is fully covered by pre-scanned shard ranges."""
     if not shard_ranges:
         return False
-
-    shard_ranges.sort()
 
     # Check if shards fully cover [start_game, end_game)
     # We need contiguous coverage from start_game to end_game-1
@@ -414,14 +416,14 @@ def _worker(
     skip_first_n_plies: int,
     result_queue: mp.Queue,
     worker_id: int,
-    skip_existing: bool = False,
+    existing_shard_ranges: list[tuple[int, int]] | None = None,
 ):
     import sys
     import traceback
 
     # Check if this range is already fully covered by existing shards
-    if skip_existing and end_game is not None:
-        if _is_range_covered(out_dir, pgn_path.stem, start_game, end_game):
+    if existing_shard_ranges is not None and end_game is not None:
+        if _is_range_covered(existing_shard_ranges, start_game, end_game):
             print(f"[Worker {worker_id}] Skipping games {start_game}-{end_game} (already covered)")
             result_queue.put({
                 "type": "done",
@@ -567,6 +569,13 @@ def main() -> int:
         if global_start >= global_end:
             return 0
 
+        # Scan existing shards ONCE before spawning workers
+        existing_shard_ranges: list[tuple[int, int]] | None = None
+        if args.skip_existing:
+            print(f"Scanning {out_dir} for existing shards...")
+            existing_shard_ranges = _scan_existing_shards(out_dir, pgn_path.stem)
+            print(f"Found {len(existing_shard_ranges)} existing shards")
+
         range_total = global_end - global_start
         ctx = mp.get_context("spawn")
         result_queue: mp.Queue = ctx.Queue()
@@ -596,7 +605,7 @@ def main() -> int:
                     args.skip_first_n_plies,
                     result_queue,
                     worker_id,
-                    args.skip_existing,
+                    existing_shard_ranges,
                 ),
             )
             proc.start()
@@ -677,7 +686,8 @@ def main() -> int:
 
     # Single-worker path: check if range is already covered
     if args.skip_existing and args.end_game is not None:
-        if _is_range_covered(out_dir, pgn_path.stem, args.start_game, args.end_game):
+        existing_shard_ranges = _scan_existing_shards(out_dir, pgn_path.stem)
+        if _is_range_covered(existing_shard_ranges, args.start_game, args.end_game):
             print(f"Skipping games {args.start_game}-{args.end_game} (already covered)")
             return 0
 
