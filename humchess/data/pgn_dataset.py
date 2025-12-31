@@ -614,6 +614,9 @@ def write_parquet_from_pgn(
         if not shard_tokens:
             return
 
+        stem = pgn_path.stem
+        shard_path = out_dir / f"{stem}_games_{shard_game_start}-{shard_game_end}.parquet"
+
         table = pa.table({
             "tokens": shard_tokens,
             "move_id": np.array(shard_move_ids, dtype=np.int16),
@@ -622,8 +625,6 @@ def write_parquet_from_pgn(
             "legal_mask": shard_masks,
         })
 
-        stem = pgn_path.stem
-        shard_path = out_dir / f"{stem}_games_{shard_game_start}-{shard_game_end}.parquet"
         pq.write_table(table, shard_path)
         shard_paths.append(shard_path)
 

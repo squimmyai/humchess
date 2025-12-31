@@ -364,6 +364,43 @@ def _read_index(path: Path) -> dict[str, int]:
     }
 
 
+def _is_range_covered(
+    out_dir: Path,
+    pgn_stem: str,
+    start_game: int,
+    end_game: int,
+) -> bool:
+    """Check if a game range is fully covered by existing shards."""
+    import re
+    pattern = re.compile(rf"^{re.escape(pgn_stem)}_games_(\d+)-(\d+)\.parquet$")
+
+    # Collect all shard ranges
+    shard_ranges: list[tuple[int, int]] = []
+    for p in out_dir.iterdir():
+        m = pattern.match(p.name)
+        if m:
+            shard_ranges.append((int(m.group(1)), int(m.group(2))))
+
+    if not shard_ranges:
+        return False
+
+    shard_ranges.sort()
+
+    # Check if shards fully cover [start_game, end_game)
+    # We need contiguous coverage from start_game to end_game-1
+    covered_up_to = start_game - 1
+    for shard_start, shard_end in shard_ranges:
+        if shard_start > covered_up_to + 1:
+            # Gap in coverage
+            break
+        if shard_start <= covered_up_to + 1 <= shard_end:
+            covered_up_to = shard_end
+        if covered_up_to >= end_game - 1:
+            return True
+
+    return covered_up_to >= end_game - 1
+
+
 def _worker(
     pgn_path: Path,
     out_dir: Path,
@@ -377,22 +414,53 @@ def _worker(
     skip_first_n_plies: int,
     result_queue: mp.Queue,
     worker_id: int,
+    skip_existing: bool = False,
 ):
-    write_parquet_from_pgn(
-        pgn_path=pgn_path,
-        out_dir=out_dir,
-        start_game=start_game,
-        end_game=end_game,
-        max_games_per_shard=max_games_per_shard,
-        max_plies_per_shard=max_plies_per_shard,
-        log_every_plies=log_every_plies,
-        min_elo=min_elo,
-        max_elo=max_elo,
-        skip_first_n_plies=skip_first_n_plies,
-        num_workers=0,
-        progress_queue=result_queue,
-        worker_id=worker_id,
-    )
+    import sys
+    import traceback
+
+    # Check if this range is already fully covered by existing shards
+    if skip_existing and end_game is not None:
+        if _is_range_covered(out_dir, pgn_path.stem, start_game, end_game):
+            print(f"[Worker {worker_id}] Skipping games {start_game}-{end_game} (already covered)")
+            result_queue.put({
+                "type": "done",
+                "worker": worker_id,
+                "plies": 0,
+                "games": 0,
+                "shards": [],
+                "range_skipped": True,
+            })
+            return
+
+    try:
+        write_parquet_from_pgn(
+            pgn_path=pgn_path,
+            out_dir=out_dir,
+            start_game=start_game,
+            end_game=end_game,
+            max_games_per_shard=max_games_per_shard,
+            max_plies_per_shard=max_plies_per_shard,
+            log_every_plies=log_every_plies,
+            min_elo=min_elo,
+            max_elo=max_elo,
+            skip_first_n_plies=skip_first_n_plies,
+            num_workers=0,
+            progress_queue=result_queue,
+            worker_id=worker_id,
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        result_queue.put({
+            "type": "error",
+            "worker": worker_id,
+            "start_game": start_game,
+            "end_game": end_game,
+            "error": str(e),
+            "traceback": tb,
+        })
+        print(f"[Worker {worker_id}] FATAL ERROR processing games {start_game}-{end_game}:\n{tb}", file=sys.stderr)
+        sys.exit(1)
 
 
 def main() -> int:
@@ -414,6 +482,7 @@ def main() -> int:
     build_parser.add_argument("--num-workers", type=int, default=0)
     build_parser.add_argument("--batch-size", type=int, default=1)
     build_parser.add_argument("--prefetch-factor", type=int, default=2)
+    build_parser.add_argument("--skip-existing", action="store_true", help="Skip shards that already exist")
 
     # Combine command
     combine_parser = subparsers.add_parser("combine", help="Combine parquet shards into one file")
@@ -483,6 +552,7 @@ def main() -> int:
         parser.add_argument("--num-workers", type=int, default=0)
         parser.add_argument("--batch-size", type=int, default=1)
         parser.add_argument("--prefetch-factor", type=int, default=2)
+        parser.add_argument("--skip-existing", action="store_true", help="Skip shards that already exist")
         args = parser.parse_args()
 
     pgn_path = Path(args.pgn)
@@ -526,6 +596,7 @@ def main() -> int:
                     args.skip_first_n_plies,
                     result_queue,
                     worker_id,
+                    args.skip_existing,
                 ),
             )
             proc.start()
@@ -533,6 +604,7 @@ def main() -> int:
 
         shards: list[str] = []
         results_received = 0
+        failed_workers: list[dict] = []
         while results_received < len(procs):
             try:
                 msg = result_queue.get(timeout=1.0)
@@ -553,6 +625,17 @@ def main() -> int:
                         f"plies_per_s={plies_per_s:.2f} games_per_s={games_per_s:.4f} "
                         f"tokens_per_s={tokens_per_s:.2f}"
                     )
+                elif msg_type == "error":
+                    worker_id = int(msg["worker"])
+                    failed_workers.append(msg)
+                    print(
+                        f"\n{'='*60}\n"
+                        f"WORKER {worker_id} FAILED (games {msg.get('start_game')}-{msg.get('end_game')})\n"
+                        f"Error: {msg.get('error')}\n"
+                        f"Traceback:\n{msg.get('traceback', 'No traceback available')}"
+                        f"{'='*60}\n"
+                    )
+                    results_received += 1
                 elif msg_type == "done":
                     worker_id = int(msg["worker"])
                     worker_state[worker_id]["plies"] = int(msg["plies"])
@@ -562,18 +645,41 @@ def main() -> int:
             except Empty:
                 for proc in procs:
                     if proc.exitcode not in (None, 0):
+                        # Check if we already got an error message for this
+                        if not any(fw.get("worker") == procs.index(proc) for fw in failed_workers):
+                            print(
+                                f"\nWorker process died with exit code {proc.exitcode} "
+                                f"(no error message received - possibly OOM or signal kill)"
+                            )
                         raise SystemExit(
                             f"Worker process failed with exit code {proc.exitcode}"
                         )
 
         for proc in procs:
             proc.join()
+
+        if failed_workers:
+            print(f"\n{'='*60}")
+            print(f"SUMMARY: {len(failed_workers)} worker(s) failed")
+            print("Missing game ranges that need to be re-processed:")
+            for fw in failed_workers:
+                print(f"  --start-game {fw.get('start_game')} --end-game {fw.get('end_game')}")
+            print(f"{'='*60}\n")
+            return 1
+
+        for proc in procs:
             if proc.exitcode != 0:
                 raise SystemExit(f"Worker process failed with exit code {proc.exitcode}")
 
         for path in shards:
             print(path)
         return 0
+
+    # Single-worker path: check if range is already covered
+    if args.skip_existing and args.end_game is not None:
+        if _is_range_covered(out_dir, pgn_path.stem, args.start_game, args.end_game):
+            print(f"Skipping games {args.start_game}-{args.end_game} (already covered)")
+            return 0
 
     shards = write_parquet_from_pgn(
         pgn_path=pgn_path,
