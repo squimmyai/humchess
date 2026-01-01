@@ -258,47 +258,6 @@ class PGNDataset(IterableDataset):
                         game_idx += 1
                 return
 
-        if worker_info is not None and shard_by_game:
-            index = self._load_pgn_index(path)
-            offsets = index["offsets"]
-            stride = index["stride"]
-            total_games = index["total_games"]
-            if total_games == 0:
-                return
-
-            global_start = max(self.start_game, 0)
-            global_end = total_games if self.end_game is None else min(self.end_game, total_games)
-            if global_start >= global_end:
-                return
-
-            range_total = global_end - global_start
-            start_idx, end_idx = _split_range(
-                range_total,
-                worker_info.id,
-                worker_info.num_workers,
-            )
-            start_idx += global_start
-            end_idx += global_start
-            if start_idx >= end_idx:
-                return
-
-            start_checkpoint = start_idx // stride
-            if start_checkpoint >= len(offsets):
-                return
-            checkpoint_offset = offsets[start_checkpoint]
-            game_idx = start_checkpoint * stride
-
-            with open(path, 'r', errors='replace') as f:
-                f.seek(checkpoint_offset)
-                while game_idx < end_idx:
-                    game = chess.pgn.read_game(f)
-                    if game is None:
-                        break
-                    if game_idx >= start_idx:
-                        yield from self._iter_game(game, path, game_idx, worker_id)
-                    game_idx += 1
-            return
-
         with open(path, 'r', errors='replace') as f:
             game_idx = 0
             while True:

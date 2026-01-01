@@ -350,8 +350,20 @@ def _read_index(path: Path) -> dict[str, int]:
         )
     data = json.loads(index_path.read_text(encoding="utf-8"))
     stat = path.stat()
-    if data.get("size") != stat.st_size or data.get("mtime") != stat.st_mtime:
-        raise ValueError(f"Index {index_path} does not match PGN file {path}.")
+    size_in_index = data.get("size")
+    mtime_in_index = data.get("mtime")
+    mismatches: list[str] = []
+    if size_in_index != stat.st_size:
+        mismatches.append(
+            f"size mismatch (index={size_in_index!r}, file={stat.st_size!r})"
+        )
+    if mtime_in_index != stat.st_mtime:
+        mismatches.append(
+            f"mtime mismatch (index={mtime_in_index!r}, file={stat.st_mtime!r})"
+        )
+    if mismatches:
+        details = "; ".join(mismatches)
+        raise ValueError(f"Index {index_path} does not match PGN file {path}: {details}")
     stride = int(data.get("stride", 1))
     if stride <= 0:
         stride = 1
@@ -403,11 +415,26 @@ def _is_range_covered(
     return covered_up_to >= end_game - 1
 
 
+def _merge_contiguous_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge adjacent ranges like [(0,10), (10,20), (30,40)] -> [(0,20), (30,40)]."""
+    if not ranges:
+        return []
+    merged: list[tuple[int, int]] = []
+    current_start, current_end = ranges[0]
+    for start, end in ranges[1:]:
+        if start == current_end:  # Contiguous
+            current_end = end
+        else:
+            merged.append((current_start, current_end))
+            current_start, current_end = start, end
+    merged.append((current_start, current_end))
+    return merged
+
+
 def _worker(
     pgn_path: Path,
     out_dir: Path,
-    start_game: int,
-    end_game: int | None,
+    assignments: list[tuple[int, int]],  # List of (start_game, end_game) tuples
     max_games_per_shard: int,
     max_plies_per_shard: int | None,
     log_every_plies: int,
@@ -416,53 +443,47 @@ def _worker(
     skip_first_n_plies: int,
     result_queue: mp.Queue,
     worker_id: int,
-    existing_shard_ranges: list[tuple[int, int]] | None = None,
 ):
     import sys
     import traceback
 
-    # Check if this range is already fully covered by existing shards
-    if existing_shard_ranges is not None and end_game is not None:
-        if _is_range_covered(existing_shard_ranges, start_game, end_game):
-            print(f"[Worker {worker_id}] Skipping games {start_game}-{end_game} (already covered)")
-            result_queue.put({
-                "type": "done",
-                "worker": worker_id,
-                "plies": 0,
-                "games": 0,
-                "shards": [],
-                "range_skipped": True,
-            })
-            return
+    # Merge contiguous ranges to reduce overhead
+    merged_assignments = _merge_contiguous_ranges(assignments)
+    print(f"[Worker {worker_id}] {len(assignments)} items merged to {len(merged_assignments)} ranges")
+    all_shards: list[str] = []
 
-    try:
-        write_parquet_from_pgn(
-            pgn_path=pgn_path,
-            out_dir=out_dir,
-            start_game=start_game,
-            end_game=end_game,
-            max_games_per_shard=max_games_per_shard,
-            max_plies_per_shard=max_plies_per_shard,
-            log_every_plies=log_every_plies,
-            min_elo=min_elo,
-            max_elo=max_elo,
-            skip_first_n_plies=skip_first_n_plies,
-            num_workers=0,
-            progress_queue=result_queue,
-            worker_id=worker_id,
-        )
-    except Exception as e:
-        tb = traceback.format_exc()
-        result_queue.put({
-            "type": "error",
-            "worker": worker_id,
-            "start_game": start_game,
-            "end_game": end_game,
-            "error": str(e),
-            "traceback": tb,
-        })
-        print(f"[Worker {worker_id}] FATAL ERROR processing games {start_game}-{end_game}:\n{tb}", file=sys.stderr)
-        sys.exit(1)
+    for start_game, end_game in merged_assignments:
+        try:
+            shards = write_parquet_from_pgn(
+                pgn_path=pgn_path,
+                out_dir=out_dir,
+                start_game=start_game,
+                end_game=end_game,
+                max_games_per_shard=max_games_per_shard,
+                max_plies_per_shard=max_plies_per_shard,
+                log_every_plies=log_every_plies,
+                min_elo=min_elo,
+                max_elo=max_elo,
+                skip_first_n_plies=skip_first_n_plies,
+                num_workers=0,
+                progress_queue=result_queue,
+                worker_id=worker_id,
+            )
+            all_shards.extend(str(p) for p in shards)
+        except Exception as e:
+            tb = traceback.format_exc()
+            result_queue.put({
+                "type": "error",
+                "worker": worker_id,
+                "start_game": start_game,
+                "end_game": end_game,
+                "error": str(e),
+                "traceback": tb,
+            })
+            print(f"[Worker {worker_id}] FATAL ERROR processing games {start_game}-{end_game}:\n{tb}", file=sys.stderr)
+            sys.exit(1)
+
+    # Note: write_parquet_from_pgn sends "done" message, so we don't send another
 
 
 def main() -> int:
@@ -570,33 +591,65 @@ def main() -> int:
             return 0
 
         # Scan existing shards ONCE before spawning workers
-        existing_shard_ranges: list[tuple[int, int]] | None = None
+        existing_shard_ranges: list[tuple[int, int]] = []
         if args.skip_existing:
-            print(f"Scanning {out_dir} for existing shards...")
+            print(f"Scanning {out_dir} for existing shards (pgn_stem={pgn_path.stem})...")
             existing_shard_ranges = _scan_existing_shards(out_dir, pgn_path.stem)
             print(f"Found {len(existing_shard_ranges)} existing shards")
+            if existing_shard_ranges:
+                print(f"  First shard: {existing_shard_ranges[0]}")
+                print(f"  Last shard: {existing_shard_ranges[-1]}")
+            # DEBUG: uncomment next line to test if scan itself causes slowdown
+            # existing_shard_ranges = []
 
-        range_total = global_end - global_start
+        # Split into shard-sized work items and filter out covered ones
+        work_items: list[tuple[int, int]] = []
+        skipped_count = 0
+        for start in range(global_start, global_end, args.max_games_per_shard):
+            end = min(start + args.max_games_per_shard, global_end)
+            if existing_shard_ranges and _is_range_covered(existing_shard_ranges, start, end):
+                skipped_count += 1
+            else:
+                work_items.append((start, end))
+
+        print(f"Work items: {len(work_items)} to process, {skipped_count} skipped (already covered)")
+
+        if not work_items:
+            print("All work items already covered, nothing to do")
+            return 0
+
+        # Distribute work items contiguously (not round-robin) so adjacent items
+        # can be merged into single ranges, reducing per-call overhead
+        num_workers = min(args.num_workers, len(work_items))
+        items_per_worker = len(work_items) // num_workers
+        extra = len(work_items) % num_workers
+
+        worker_assignments: list[list[tuple[int, int]]] = []
+        idx = 0
+        for w in range(num_workers):
+            count = items_per_worker + (1 if w < extra else 0)
+            worker_assignments.append(work_items[idx:idx + count])
+            idx += count
+
+        print(f"Distributing {len(work_items)} work items to {num_workers} workers")
+
         ctx = mp.get_context("spawn")
         result_queue: mp.Queue = ctx.Queue()
         procs: list[mp.Process] = []
         start_time = time.perf_counter()
         worker_state: dict[int, dict[str, int]] = {}
 
-        for worker_id in range(args.num_workers):
-            start, end = _split_range(range_total, worker_id, args.num_workers)
-            start += global_start
-            end += global_start
-            if start >= end:
+        for worker_id, assignments in enumerate(worker_assignments):
+            if not assignments:
                 continue
+
             worker_state[worker_id] = {"plies": 0, "games": 0}
             proc = ctx.Process(
                 target=_worker,
                 args=(
                     pgn_path,
                     out_dir,
-                    start,
-                    end,
+                    assignments,  # List of (start, end) tuples
                     args.max_games_per_shard,
                     args.max_plies_per_shard,
                     args.log_every_plies,
@@ -605,16 +658,20 @@ def main() -> int:
                     args.skip_first_n_plies,
                     result_queue,
                     worker_id,
-                    existing_shard_ranges,
                 ),
             )
             proc.start()
             procs.append(proc)
 
+        # Handle case where no workers were spawned (shouldn't happen given earlier check)
+        if not procs:
+            print("No workers spawned, nothing to do")
+            return 0
+
         shards: list[str] = []
-        results_received = 0
+        finished_workers: set[int] = set()
         failed_workers: list[dict] = []
-        while results_received < len(procs):
+        while len(finished_workers) < len(procs):
             try:
                 msg = result_queue.get(timeout=1.0)
                 msg_type = msg.get("type")
@@ -636,21 +693,23 @@ def main() -> int:
                     )
                 elif msg_type == "error":
                     worker_id = int(msg["worker"])
-                    failed_workers.append(msg)
-                    print(
-                        f"\n{'='*60}\n"
-                        f"WORKER {worker_id} FAILED (games {msg.get('start_game')}-{msg.get('end_game')})\n"
-                        f"Error: {msg.get('error')}\n"
-                        f"Traceback:\n{msg.get('traceback', 'No traceback available')}"
-                        f"{'='*60}\n"
-                    )
-                    results_received += 1
+                    if worker_id not in finished_workers:
+                        failed_workers.append(msg)
+                        finished_workers.add(worker_id)
+                        print(
+                            f"\n{'='*60}\n"
+                            f"WORKER {worker_id} FAILED (games {msg.get('start_game')}-{msg.get('end_game')})\n"
+                            f"Error: {msg.get('error')}\n"
+                            f"Traceback:\n{msg.get('traceback', 'No traceback available')}"
+                            f"{'='*60}\n"
+                        )
                 elif msg_type == "done":
                     worker_id = int(msg["worker"])
                     worker_state[worker_id]["plies"] = int(msg["plies"])
                     worker_state[worker_id]["games"] = int(msg["games"])
                     shards.extend(msg.get("shards", []))
-                    results_received += 1
+                    # Mark worker as finished (handles multiple done messages from same worker)
+                    finished_workers.add(worker_id)
             except Empty:
                 for proc in procs:
                     if proc.exitcode not in (None, 0):
