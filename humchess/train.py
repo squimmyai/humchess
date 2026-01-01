@@ -30,7 +30,7 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
-from .data.pgn_dataset import PGNDataset, collate_fn
+from .data.pgn_dataset import PGNDataset
 from .model.transformer import ChessTransformer
 
 
@@ -113,13 +113,10 @@ def expand_globs(patterns: list[str]) -> list[Path]:
     return paths
 
 
-def count_parquet_samples(paths: list[Path]) -> int:
-    """Count total samples across parquet files using metadata (fast)."""
+def get_samples_per_shard(paths: list[Path]) -> int:
+    """Get samples per shard by reading metadata from first file."""
     import pyarrow.parquet as pq
-    total = 0
-    for p in paths:
-        total += pq.ParquetFile(p).metadata.num_rows
-    return total
+    return pq.ParquetFile(paths[0]).metadata.num_rows
 
 
 def train_epoch(
@@ -131,7 +128,8 @@ def train_epoch(
     scaler: torch.cuda.amp.GradScaler | None,
     rank: int = 0,
     log_interval: int = 100,
-    total_dataset_samples: int | None = None,
+    total_shards: int | None = None,
+    samples_per_shard: int | None = None,
     use_wandb: bool = False,
 ) -> dict:
     """Train for one epoch."""
@@ -233,16 +231,18 @@ def train_epoch(
             move_acc = total_correct / total_samples * 100
 
             progress_str = ""
-            if total_dataset_samples:
-                pct = total_samples / total_dataset_samples * 100
-                remaining = total_dataset_samples - total_samples
-                eta_sec = remaining / samples_per_sec if samples_per_sec > 0 else 0
+            if total_shards and samples_per_shard:
+                shards_done = total_samples / samples_per_shard
+                pct = shards_done / total_shards * 100
+                remaining_shards = total_shards - shards_done
+                remaining_samples = remaining_shards * samples_per_shard
+                eta_sec = remaining_samples / samples_per_sec if samples_per_sec > 0 else 0
                 eta_min = eta_sec / 60
                 if eta_min >= 60:
                     eta_str = f"{eta_min/60:.1f}h"
                 else:
                     eta_str = f"{eta_min:.1f}m"
-                progress_str = f" | {total_samples:,}/{total_dataset_samples:,} ({pct:.1f}%) ETA {eta_str}"
+                progress_str = f" | shard ~{shards_done:.1f}/{total_shards} ({pct:.1f}%) ETA {eta_str}"
 
             print(f"  Batch {batch_idx + 1}: loss={avg_loss:.4f}, "
                   f"move_acc={move_acc:.1f}%, "
@@ -256,8 +256,10 @@ def train_epoch(
                     'train/samples_per_sec': samples_per_sec,
                     'train/samples': total_samples,
                 }
-                if total_dataset_samples:
-                    log_dict['train/progress_pct'] = total_samples / total_dataset_samples * 100
+                if total_shards and samples_per_shard:
+                    shards_done = total_samples / samples_per_shard
+                    log_dict['train/shards_done'] = shards_done
+                    log_dict['train/progress_pct'] = shards_done / total_shards * 100
                 if total_promo_samples > 0:
                     log_dict['train/promo_loss'] = total_promo_loss / total_promo_samples
                     log_dict['train/promo_accuracy'] = total_promo_correct / total_promo_samples
@@ -293,6 +295,8 @@ def main():
                         help='Override training precision')
     parser.add_argument('--tf32', action='store_true',
                         help='Enable TF32 matmul on CUDA')
+    parser.add_argument('--compile', action='store_true',
+                        help='Use torch.compile() for faster training')
     parser.add_argument('--wandb', action='store_true',
                         help='Enable Weights & Biases logging')
     parser.add_argument('--wandb-project', type=str, default='humchess',
@@ -341,6 +345,12 @@ def main():
     if rank == 0:
         print(f"Model params: {model_params}")
         print(f"Model parameters: {model.count_parameters():,}")
+
+    # Compile model for faster training
+    if args.compile:
+        if rank == 0:
+            print("Compiling model with torch.compile()...")
+        model = torch.compile(model, mode='reduce-overhead')
 
     # Initialize wandb
     use_wandb = args.wandb and rank == 0
@@ -397,20 +407,21 @@ def main():
             if rank == 0:
                 print(f"Warning: Resume checkpoint not found: {resume_path}")
 
-    total_dataset_samples = None
+    total_shards = None
+    samples_per_shard = None
     if parquet_patterns:
         parquet_paths = expand_globs(parquet_patterns)
         if rank == 0:
             print(f"Parquet files: {len(parquet_paths)} shards")
-            print("Counting samples...")
-            total_samples_all_ranks = count_parquet_samples(parquet_paths)
-            # Each rank sees ~1/world_size of the samples
-            total_dataset_samples = total_samples_all_ranks // world_size
-            print(f"Total samples: {total_samples_all_ranks:,} ({total_dataset_samples:,} per rank)")
+            samples_per_shard = get_samples_per_shard(parquet_paths)
+            # Each rank sees ~1/world_size of the shards
+            total_shards = len(parquet_paths) // world_size
+            print(f"Total shards: {len(parquet_paths)} ({total_shards} per rank, ~{samples_per_shard:,} samples/shard)")
         dataset = PGNDataset.from_parquet(
             parquet_paths=parquet_paths,
             rank=rank,
             world_size=world_size,
+            batch_size=batch_size,
         )
     elif pgn_patterns:
         pgn_paths = expand_globs(pgn_patterns)
@@ -427,16 +438,19 @@ def main():
     # Create dataloader
     # Note: IterableDataset doesn't use sampler in the traditional sense
     # Workers handle sharding internally via get_worker_info()
+    # Dataset yields pre-batched dicts, so batch_size=1 and no collation needed
+    prefetch_factor = train_cfg.get('prefetch_factor', 4)
     dataloader = DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=1,  # Dataset yields pre-batched data
         num_workers=num_workers,
-        collate_fn=collate_fn,
+        collate_fn=lambda x: x[0],  # Unwrap the single-item list
         pin_memory=True,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
 
     # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, fused=True)
 
     # Load model/optimizer state if resuming
     if resume_checkpoint:
@@ -462,7 +476,8 @@ def main():
             scaler=scaler,
             rank=rank,
             log_interval=log_interval,
-            total_dataset_samples=total_dataset_samples,
+            total_shards=total_shards,
+            samples_per_shard=samples_per_shard,
             use_wandb=use_wandb,
         )
 

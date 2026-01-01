@@ -131,6 +131,7 @@ class PGNDataset(IterableDataset):
         self.world_size = world_size
         self._legal_mask_cache: LRUCache = LRUCache(maxsize=100_000)
         self._pgn_index_cache: dict[Path, dict[str, object]] = {}
+        self._batch_size: int = 1024  # Default, overridden by from_parquet
 
     @classmethod
     def from_parquet(
@@ -138,9 +139,12 @@ class PGNDataset(IterableDataset):
         parquet_paths: list[str | Path],
         rank: int = 0,
         world_size: int = 1,
+        batch_size: int = 1024,
     ) -> "PGNDataset":
         """Create a dataset that reads pre-tokenized Parquet shards."""
-        return cls(pgn_paths=None, parquet_paths=parquet_paths, rank=rank, world_size=world_size)
+        dataset = cls(pgn_paths=None, parquet_paths=parquet_paths, rank=rank, world_size=world_size)
+        dataset._batch_size = batch_size
+        return dataset
 
     def __iter__(self) -> Iterator[dict]:
         worker_info = get_worker_info()
@@ -170,6 +174,7 @@ class PGNDataset(IterableDataset):
             yield from self._iter_pgn(path, worker_info, shard_by_game)
 
     def _iter_parquet(self, worker_info) -> Iterator[dict]:
+        import numpy as np
         import pyarrow.parquet as pq
 
         # Two-level sharding: by DDP rank first, then by DataLoader worker
@@ -194,30 +199,25 @@ class PGNDataset(IterableDataset):
 
         for path in paths:
             parquet_file = pq.ParquetFile(path)
-            print(f"Worker {worker_info.id if worker_info else 0} reading Parquet file: {path}")
-            for batch in parquet_file.iter_batches():
-                schema = batch.schema
-                tokens_col = batch.column(schema.get_field_index("tokens"))
-                move_col = batch.column(schema.get_field_index("move_id"))
-                promo_col = batch.column(schema.get_field_index("promo_id"))
-                promo_flag_col = batch.column(schema.get_field_index("is_promotion"))
-                mask_col = batch.column(schema.get_field_index("legal_mask"))
+            for batch in parquet_file.iter_batches(batch_size=self._batch_size):
+                # Vectorized conversion - much faster than row-by-row
+                tokens = torch.from_numpy(np.array(batch.column("tokens").to_pylist(), dtype=np.int64))
+                move_ids = torch.from_numpy(batch.column("move_id").to_numpy().astype(np.int64))
+                promo_ids = torch.from_numpy(batch.column("promo_id").to_numpy().astype(np.int64))
+                is_promos = torch.from_numpy(batch.column("is_promotion").to_numpy(zero_copy_only=False))
 
-                for i in range(batch.num_rows):
-                    tokens = torch.tensor(tokens_col[i].as_py(), dtype=torch.long)
-                    move_id = int(move_col[i].as_py())
-                    promo_id = int(promo_col[i].as_py())
-                    is_promo = bool(promo_flag_col[i].as_py())
-                    legal_mask = _unpack_legal_mask(mask_col[i].as_py())
+                # Vectorized legal mask unpacking
+                mask_bytes_list = batch.column("legal_mask").to_pylist()
+                legal_masks = _unpack_legal_masks_batch(mask_bytes_list)
 
-                    yield {
-                        'tokens': tokens,
-                        'move_id': move_id,
-                        'promo_id': promo_id,
-                        'legal_mask': legal_mask,
-                        'is_promotion': is_promo,
-                        'shard_path': str(path),
-                    }
+                # Yield pre-batched dict
+                yield {
+                    'tokens': tokens,
+                    'move_id': move_ids,
+                    'promo_id': promo_ids,
+                    'legal_mask': legal_masks,
+                    'is_promotion': is_promos,
+                }
                     
     def _iter_pgn(self, path: Path, worker_info, shard_by_game: bool) -> Iterator[dict]:
         """Iterate over all positions in a single PGN file."""
@@ -493,6 +493,19 @@ def _unpack_legal_mask(data: bytes) -> torch.Tensor:
 
     bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8), bitorder="little")[:NUM_MOVE_CLASSES]
     return torch.from_numpy(bits.astype(bool))
+
+
+def _unpack_legal_masks_batch(mask_bytes_list: list[bytes]) -> torch.Tensor:
+    """Unpack a batch of legal masks efficiently."""
+    import numpy as np
+
+    batch_size = len(mask_bytes_list)
+    # Concatenate all bytes, unpack once
+    all_bytes = b''.join(mask_bytes_list)
+    all_bits = np.unpackbits(np.frombuffer(all_bytes, dtype=np.uint8), bitorder="little")
+    # Reshape to (batch, 4096) - each mask is 512 bytes = 4096 bits
+    masks = all_bits.reshape(batch_size, -1)[:, :NUM_MOVE_CLASSES]
+    return torch.from_numpy(masks.astype(bool))
 
 
 def _split_range(total: int, worker_id: int, num_workers: int) -> tuple[int, int]:

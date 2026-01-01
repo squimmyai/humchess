@@ -1,13 +1,13 @@
 model:
   d_model: 384
   n_heads: 8
-  n_layers: 8
+  n_layers: 10
   d_ff: 1536
 
 data:
   # Parquet shards - supports globs and directories
   parquet:
-    - data/tokenized/lichess_db_standard_rated_2017-04*
+    - /teamspace/r2_connections/cloudflare/tokenized-2022-01/*.parquet
   # PGN files (alternative to parquet, slower)
   # pgn:
   #   - data/*.pgn
@@ -16,9 +16,10 @@ data:
 
 training:
   checkpoint_dir: checkpoints
-  batch_size: 768
+  batch_size: 6500
   lr: 1e-4
   epochs: 1
-  num_workers: 4
+  num_workers: 8
+  prefetch_factor: 4  # batches to prefetch per worker
   precision: bf16  # bf16, fp16, fp32
   log_interval: 100
