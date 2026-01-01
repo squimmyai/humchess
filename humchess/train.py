@@ -350,7 +350,7 @@ def main():
     if args.compile:
         if rank == 0:
             print("Compiling model with torch.compile()...")
-        model = torch.compile(model, mode='reduce-overhead')
+        model = torch.compile(model)
 
     # Initialize wandb
     use_wandb = args.wandb and rank == 0
