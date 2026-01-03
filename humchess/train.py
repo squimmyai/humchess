@@ -71,9 +71,8 @@ def masked_cross_entropy(
     Returns:
         Scalar loss.
     """
-    # Apply mask: set illegal logits to -inf
-    masked_logits = logits.clone()
-    masked_logits[~mask] = float('-inf')
+    # Apply mask: set illegal logits to -inf (masked_fill avoids clone)
+    masked_logits = logits.masked_fill(~mask, float('-inf'))
 
     return nn.functional.cross_entropy(masked_logits, targets)
 
@@ -131,28 +130,29 @@ def train_epoch(
     total_shards: int | None = None,
     samples_per_shard: int | None = None,
     use_wandb: bool = False,
+    max_batches: int | None = None,
+    profiler: torch.profiler.profile | None = None,
 ) -> dict:
     """Train for one epoch."""
     model.train()
 
-    total_loss = 0.0
-    total_move_loss = 0.0
-    total_promo_loss = 0.0
-    total_samples = 0
-    total_correct = 0
-    total_promo_samples = 0
-    total_promo_correct = 0
+    # Accumulate stats on GPU to avoid CPU-GPU sync every batch
+    total_loss_t = torch.tensor(0.0, device=device)
+    total_move_loss_t = torch.tensor(0.0, device=device)
+    total_promo_loss_t = torch.tensor(0.0, device=device)
+    total_samples_t = torch.tensor(0, device=device, dtype=torch.long)
+    total_correct_t = torch.tensor(0, device=device, dtype=torch.long)
+    total_promo_samples_t = torch.tensor(0, device=device, dtype=torch.long)
+    total_promo_correct_t = torch.tensor(0, device=device, dtype=torch.long)
 
     start_time = time.time()
 
-    seen = 0  # for debug logging
-
     for batch_idx, batch in enumerate(dataloader):
-        tokens = batch['tokens'].to(device)
-        move_targets = batch['move_id'].to(device)
-        promo_targets = batch['promo_id'].to(device)
-        legal_mask = batch['legal_mask'].to(device)
-        is_promotion = batch['is_promotion'].to(device)
+        tokens = batch['tokens'].to(device, non_blocking=True)
+        move_targets = batch['move_id'].to(device, non_blocking=True)
+        promo_targets = batch['promo_id'].to(device, non_blocking=True)
+        legal_mask = batch['legal_mask'].to(device, non_blocking=True)
+        is_promotion = batch['is_promotion'].to(device, non_blocking=True)
 
         # Forward pass
         if precision == 'bf16':
@@ -161,16 +161,6 @@ def train_epoch(
             autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
         else:
             autocast_ctx = nullcontext()
-
-        with torch.no_grad():
-            target_is_legal = legal_mask.gather(1, move_targets.unsqueeze(1)).squeeze(1)
-            illegal_target = ~target_is_legal
-            bad_idx = torch.where(illegal_target)[0]
-
-            if bad_idx.numel() > 0 and rank == 0:
-                for i in bad_idx[:10].tolist():
-                    sample_num = seen + i
-                    print(f"[illegal_target] batch={batch_idx} in_batch={i} sample_num={sample_num}")
 
         with autocast_ctx:
             outputs = model(tokens)
@@ -181,13 +171,16 @@ def train_epoch(
             move_loss = masked_cross_entropy(move_logits, move_targets, legal_mask)
 
             # Promotion loss (only for promotion moves)
-            promo_loss = torch.tensor(0.0, device=device)
-            if is_promotion.any():
-                promo_mask = is_promotion
-                promo_loss = nn.functional.cross_entropy(
-                    promo_logits[promo_mask],
-                    promo_targets[promo_mask],
-                )
+            # Clamp targets to valid range to avoid CUDA errors, then mask out non-promos
+            safe_promo_targets = promo_targets.clamp(0, 3)
+            promo_loss_per_sample = nn.functional.cross_entropy(
+                promo_logits,
+                safe_promo_targets,
+                reduction='none',
+            )
+            # Mask to zero for non-promotions and average over actual promotions
+            num_promos = is_promotion.sum().clamp(min=1)
+            promo_loss = (promo_loss_per_sample * is_promotion.float()).sum() / num_promos
 
             # Total loss
             loss = move_loss + promo_loss
@@ -202,29 +195,36 @@ def train_epoch(
             loss.backward()
             optimizer.step()
 
-        # Stats
+        # Stats - accumulate on GPU (no sync!)
         batch_size = tokens.size(0)
-        total_loss += loss.item() * batch_size
-        total_move_loss += move_loss.item() * batch_size
-        total_samples += batch_size
-
-        # Move accuracy (with masking)
         with torch.no_grad():
-            masked_logits = move_logits.clone()
-            masked_logits[~legal_mask] = float('-inf')
+            num_promos = is_promotion.sum()
+            total_loss_t += loss.detach() * batch_size
+            total_move_loss_t += move_loss.detach() * batch_size
+            total_samples_t += batch_size
+
+            # Move accuracy (with masking)
+            masked_logits = move_logits.masked_fill(~legal_mask, float('-inf'))
             preds = masked_logits.argmax(dim=-1)
-            total_correct += (preds == move_targets).sum().item()
+            total_correct_t += (preds == move_targets).sum()
 
-            # Promotion accuracy
-            if is_promotion.any():
-                promo_mask = is_promotion
-                promo_preds = promo_logits[promo_mask].argmax(dim=-1)
-                total_promo_correct += (promo_preds == promo_targets[promo_mask]).sum().item()
-                total_promo_samples += promo_mask.sum().item()
-                total_promo_loss += promo_loss.item() * promo_mask.sum().item()
+            # Promotion accuracy - accumulate without sync
+            promo_preds = promo_logits.argmax(dim=-1)
+            total_promo_correct_t += ((promo_preds == promo_targets) & is_promotion).sum()
+            total_promo_samples_t += num_promos
+            total_promo_loss_t += promo_loss.detach() * num_promos
 
-        # Logging
+        # Logging - only sync at log intervals
         if rank == 0 and (batch_idx + 1) % log_interval == 0:
+            # Single sync point: pull all stats from GPU
+            total_samples = total_samples_t.item()
+            total_loss = total_loss_t.item()
+            total_move_loss = total_move_loss_t.item()
+            total_correct = total_correct_t.item()
+            total_promo_samples = total_promo_samples_t.item()
+            total_promo_correct = total_promo_correct_t.item()
+            total_promo_loss = total_promo_loss_t.item()
+
             elapsed = time.time() - start_time
             samples_per_sec = total_samples / elapsed
             avg_loss = total_loss / total_samples
@@ -265,9 +265,25 @@ def train_epoch(
                     log_dict['train/promo_accuracy'] = total_promo_correct / total_promo_samples
                 wandb.log(log_dict)
 
-        seen += tokens.size(0)  # for debug logging
+        # Step profiler
+        if profiler is not None:
+            profiler.step()
 
-    # Final stats
+        # Early stop for testing
+        if max_batches is not None and batch_idx + 1 >= max_batches:
+            if rank == 0:
+                print(f"Stopping after {max_batches} batches (--max-batches)")
+            break
+
+    # Final stats - sync from GPU once at end
+    total_samples = total_samples_t.item()
+    total_loss = total_loss_t.item()
+    total_move_loss = total_move_loss_t.item()
+    total_correct = total_correct_t.item()
+    total_promo_samples = total_promo_samples_t.item()
+    total_promo_correct = total_promo_correct_t.item()
+    total_promo_loss = total_promo_loss_t.item()
+
     stats = {
         'loss': total_loss / total_samples,
         'move_loss': total_move_loss / total_samples,
@@ -297,6 +313,9 @@ def main():
                         help='Enable TF32 matmul on CUDA')
     parser.add_argument('--compile', action='store_true',
                         help='Use torch.compile() for faster training')
+    parser.add_argument('--compile-mode', type=str, default='reduce-overhead',
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile mode')
     parser.add_argument('--wandb', action='store_true',
                         help='Enable Weights & Biases logging')
     parser.add_argument('--wandb-project', type=str, default='humchess',
@@ -305,6 +324,12 @@ def main():
                         help='W&B run name (auto-generated if not set)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
+    parser.add_argument('--max-batches', type=int, default=None,
+                        help='Stop after N batches (for testing)')
+    parser.add_argument('--profile', action='store_true',
+                        help='Enable torch.profiler (outputs Chrome trace)')
+    parser.add_argument('--profile-batches', type=int, default=20,
+                        help='Number of batches to profile (default: 20)')
     args = parser.parse_args()
 
     # Load config
@@ -342,6 +367,10 @@ def main():
     model = ChessTransformer(**model_params)
     model = model.to(device)
 
+    # Cast to bf16 for fused RMSNorm kernels (avoids dtype mismatch with autocast)
+    if precision == 'bf16':
+        model = model.to(torch.bfloat16)
+
     if rank == 0:
         print(f"Model params: {model_params}")
         print(f"Model parameters: {model.count_parameters():,}")
@@ -349,8 +378,8 @@ def main():
     # Compile model for faster training
     if args.compile:
         if rank == 0:
-            print("Compiling model with torch.compile()...")
-        model = torch.compile(model)
+            print(f"Compiling model with torch.compile(mode='{args.compile_mode}')...")
+        model = torch.compile(model, mode=args.compile_mode, fullgraph=True)
 
     # Initialize wandb
     use_wandb = args.wandb and rank == 0
@@ -463,6 +492,39 @@ def main():
     # Training loop
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
 
+    # Setup profiler if requested
+    profiler = None
+    if args.profile and rank == 0:
+        # Skip first few batches (warmup), then profile
+        wait_batches = 5
+        warmup_batches = 3
+        active_batches = args.profile_batches
+        profile_dir = Path('profiler_output')
+        profile_dir.mkdir(exist_ok=True)
+
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=wait_batches,
+                warmup=warmup_batches,
+                active=active_batches,
+                repeat=1,
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(profile_dir)),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+        profiler.start()
+        print(f"Profiler enabled: skip {wait_batches}, warmup {warmup_batches}, profile {active_batches} batches")
+        print(f"Output: {profile_dir}/")
+        # Override max_batches to stop after profiling
+        if args.max_batches is None:
+            args.max_batches = wait_batches + warmup_batches + active_batches + 5
+
     for epoch in range(start_epoch, epochs):
         if rank == 0:
             print(f"\nEpoch {epoch + 1}/{epochs}")
@@ -479,6 +541,8 @@ def main():
             total_shards=total_shards,
             samples_per_shard=samples_per_shard,
             use_wandb=use_wandb,
+            max_batches=args.max_batches,
+            profiler=profiler,
         )
 
         if rank == 0:
@@ -509,6 +573,11 @@ def main():
                 'stats': stats,
             }, checkpoint_path)
             print(f"  Saved checkpoint: {checkpoint_path}")
+
+    if profiler is not None:
+        profiler.stop()
+        print(f"\nProfiler trace saved to: profiler_output/")
+        print("View with: tensorboard --logdir=profiler_output")
 
     cleanup_distributed()
 

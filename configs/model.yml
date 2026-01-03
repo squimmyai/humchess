@@ -1,8 +1,8 @@
 model:
-  d_model: 416
+  d_model: 384
   n_heads: 8
-  n_layers: 10
-  d_ff: 1664
+  n_layers: 11
+  d_ff: 1536
 
 data:
   # Parquet shards - supports globs and directories
@@ -16,10 +16,10 @@ data:
 
 training:
   checkpoint_dir: checkpoints
-  batch_size: 5400
+  batch_size: 7000
   lr: 1e-4
   epochs: 1
-  num_workers: 8
+  num_workers: 12
   prefetch_factor: 4  # batches to prefetch per worker
   precision: bf16  # bf16, fp16, fp32
   log_interval: 100
