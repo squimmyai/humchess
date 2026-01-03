@@ -205,6 +205,7 @@ class PGNDataset(IterableDataset):
         include_metadata: bool = False,
         rank: int = 0,
         world_size: int = 1,
+        skip_shards: Optional[set[str]] = None,
     ):
         """
         Args:
@@ -214,6 +215,7 @@ class PGNDataset(IterableDataset):
             skip_first_n_plies: Skip opening moves (e.g., 10 to skip first 5 moves each).
             start_game: First game index to include per PGN file.
             end_game: End game index (exclusive) per PGN file.
+            skip_shards: Set of shard paths to skip (for resuming from checkpoint).
         """
         self.pgn_paths = [Path(p) for p in pgn_paths or []]
         # Keep S3 URLs as strings (Path mangles s3:// to s3:/)
@@ -229,6 +231,7 @@ class PGNDataset(IterableDataset):
         self.include_metadata = include_metadata
         self.rank = rank
         self.world_size = world_size
+        self.skip_shards = skip_shards or set()
         self._legal_mask_cache: LRUCache = LRUCache(maxsize=100_000)
         self._pgn_index_cache: dict[Path, dict[str, object]] = {}
         self._batch_size: int = 1024  # Default, overridden by from_parquet
@@ -240,9 +243,16 @@ class PGNDataset(IterableDataset):
         rank: int = 0,
         world_size: int = 1,
         batch_size: int = 1024,
+        skip_shards: Optional[set[str]] = None,
     ) -> "PGNDataset":
         """Create a dataset that reads pre-tokenized Parquet shards."""
-        dataset = cls(pgn_paths=None, parquet_paths=parquet_paths, rank=rank, world_size=world_size)
+        dataset = cls(
+            pgn_paths=None,
+            parquet_paths=parquet_paths,
+            rank=rank,
+            world_size=world_size,
+            skip_shards=skip_shards,
+        )
         dataset._batch_size = batch_size
         return dataset
 
@@ -285,7 +295,7 @@ class PGNDataset(IterableDataset):
                 if i % self.world_size == self.rank
             ]
         else:
-            rank_paths = self.parquet_paths
+            rank_paths = list(self.parquet_paths)
 
         if worker_info is None:
             paths = rank_paths
@@ -295,6 +305,10 @@ class PGNDataset(IterableDataset):
                 p for i, p in enumerate(rank_paths)
                 if i % worker_info.num_workers == worker_info.id
             ]
+
+        # Filter out already-completed shards (for resume)
+        if self.skip_shards:
+            paths = [p for p in paths if str(p) not in self.skip_shards]
 
         # Check if using S3 paths (check first path, assume all are same type)
         use_s3 = paths and str(paths[0]).startswith('s3://')
@@ -307,13 +321,25 @@ class PGNDataset(IterableDataset):
                 bucket, key = _parse_s3_path(path_str)
                 # Use read_table for R2 compatibility (avoids range request issues)
                 table = pq.read_table(f"{bucket}/{key}", filesystem=fs)
-                for i in range(0, table.num_rows, self._batch_size):
-                    batch = table.slice(i, min(self._batch_size, table.num_rows - i))
-                    yield from self._process_parquet_batch(batch)
+                num_rows = table.num_rows
+                for i in range(0, num_rows, self._batch_size):
+                    batch = table.slice(i, min(self._batch_size, num_rows - i))
+                    is_last_batch = (i + self._batch_size >= num_rows)
+                    for result in self._process_parquet_batch(batch):
+                        result['shard_path'] = path_str
+                        result['shard_complete'] = is_last_batch
+                        yield result
             else:
                 parquet_file = pq.ParquetFile(path)
+                num_rows = parquet_file.metadata.num_rows
+                rows_yielded = 0
                 for batch in parquet_file.iter_batches(batch_size=self._batch_size):
-                    yield from self._process_parquet_batch(batch)
+                    rows_yielded += batch.num_rows
+                    is_last_batch = (rows_yielded >= num_rows)
+                    for result in self._process_parquet_batch(batch):
+                        result['shard_path'] = path_str
+                        result['shard_complete'] = is_last_batch
+                        yield result
 
     def _process_parquet_batch(self, batch) -> Iterator[dict]:
         """Process a single parquet batch into training samples."""

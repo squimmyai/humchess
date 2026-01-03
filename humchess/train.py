@@ -143,6 +143,42 @@ def get_samples_per_shard(paths: list[Path | str]) -> int:
         return pq.ParquetFile(paths[0]).metadata.num_rows
 
 
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.cuda.amp.GradScaler | None,
+    completed_shards: set[str],
+    is_distributed: bool,
+    rank: int = 0,
+    world_size: int = 1,
+) -> None:
+    """Save checkpoint with model, optimizer, and completed shards."""
+    # Gather completed shards from all ranks
+    if is_distributed and world_size > 1:
+        all_completed: list[list[str]] = [None] * world_size
+        dist.all_gather_object(all_completed, list(completed_shards))
+        # Flatten into single set
+        all_shards = set()
+        for rank_shards in all_completed:
+            all_shards.update(rank_shards)
+    else:
+        all_shards = completed_shards
+
+    # Only rank 0 saves
+    if rank == 0:
+        model_to_save = model.module if is_distributed else model
+        checkpoint = {
+            'model_state_dict': model_to_save.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'completed_shards': list(all_shards),
+        }
+        if scaler is not None:
+            checkpoint['scaler_state_dict'] = scaler.state_dict()
+        torch.save(checkpoint, path)
+        print(f"  Saved checkpoint: {path} ({len(all_shards)} shards completed)")
+
+
 def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -158,6 +194,9 @@ def train_epoch(
     use_wandb: bool = False,
     max_batches: int | None = None,
     profiler: torch.profiler.profile | None = None,
+    checkpoint_dir: Path | None = None,
+    checkpoint_every_n_shards: int | None = None,
+    is_distributed: bool = False,
 ) -> dict:
     """Train for one epoch."""
     model.train()
@@ -170,6 +209,10 @@ def train_epoch(
     total_correct_t = torch.tensor(0, device=device, dtype=torch.long)
     total_promo_samples_t = torch.tensor(0, device=device, dtype=torch.long)
     total_promo_correct_t = torch.tensor(0, device=device, dtype=torch.long)
+
+    # Shard-based checkpointing
+    completed_shards: set[str] = set()
+    last_checkpoint_shard_count = 0
 
     start_time = time.time()
 
@@ -239,6 +282,29 @@ def train_epoch(
             total_promo_correct_t += ((promo_preds == promo_targets) & is_promotion).sum()
             total_promo_samples_t += num_promos
             total_promo_loss_t += promo_loss.detach() * num_promos
+
+        # Track completed shards for checkpointing
+        if batch.get('shard_complete', False):
+            shard_path = batch.get('shard_path')
+            if shard_path:
+                completed_shards.add(shard_path)
+
+                # Checkpoint every N shards
+                if (checkpoint_every_n_shards is not None
+                    and checkpoint_dir is not None
+                    and len(completed_shards) >= last_checkpoint_shard_count + checkpoint_every_n_shards):
+                    checkpoint_path = checkpoint_dir / f'checkpoint_shards_{len(completed_shards)}.pt'
+                    save_checkpoint(
+                        path=checkpoint_path,
+                        model=model,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        completed_shards=completed_shards,
+                        is_distributed=is_distributed,
+                        rank=rank,
+                        world_size=world_size,
+                    )
+                    last_checkpoint_shard_count = len(completed_shards)
 
         # Logging - only sync at log intervals
         if (batch_idx + 1) % log_interval == 0:
@@ -321,6 +387,7 @@ def train_epoch(
         'loss': total_loss / total_samples,
         'move_loss': total_move_loss / total_samples,
         'move_accuracy': total_correct / total_samples,
+        'completed_shards': completed_shards,
     }
 
     if total_promo_samples > 0:
@@ -337,9 +404,10 @@ def main():
     # CLI overrides (optional)
     parser.add_argument('--batch-size', type=int, help='Override batch size')
     parser.add_argument('--lr', type=float, help='Override learning rate')
-    parser.add_argument('--epochs', type=int, help='Override epochs')
     parser.add_argument('--num-workers', type=int, help='Override num workers')
     parser.add_argument('--checkpoint-dir', type=str, help='Override checkpoint dir')
+    parser.add_argument('--checkpoint-every-n-shards', type=int, default=None,
+                        help='Save checkpoint every N shards (default: from config or 100)')
     parser.add_argument('--precision', type=str, choices=['bf16', 'fp16', 'fp32'],
                         help='Override training precision')
     parser.add_argument('--tf32', action='store_true',
@@ -377,11 +445,11 @@ def main():
     # Apply CLI overrides
     batch_size = args.batch_size or train_cfg.get('batch_size', 256)
     lr = args.lr or float(train_cfg.get('lr', 1e-4))
-    epochs = args.epochs or train_cfg.get('epochs', 1)
     num_workers = args.num_workers or train_cfg.get('num_workers', 4)
     checkpoint_dir = Path(args.checkpoint_dir or train_cfg.get('checkpoint_dir', 'checkpoints'))
     precision = args.precision or train_cfg.get('precision', 'bf16')
     log_interval = train_cfg.get('log_interval', 100)
+    checkpoint_every_n_shards = args.checkpoint_every_n_shards or train_cfg.get('checkpoint_every_n_shards', 100)
 
     # Setup distributed
     rank, world_size, local_rank, is_distributed = setup_distributed()
@@ -394,6 +462,7 @@ def main():
         print(f"Learning rate: {lr}")
         print(f"Precision: {precision}")
         print(f"TF32: {args.tf32}")
+        print(f"Checkpoint every: {checkpoint_every_n_shards} shards")
 
     # Create model
     model_params = {key: int(model_cfg[key]) for key in ['d_model', 'n_heads', 'n_layers', 'd_ff']}
@@ -429,7 +498,7 @@ def main():
                     'model_parameters': model.count_parameters(),
                     'batch_size': batch_size,
                     'learning_rate': lr,
-                    'epochs': epochs,
+                    'checkpoint_every_n_shards': checkpoint_every_n_shards,
                     'precision': precision,
                     'tf32': args.tf32,
                     'num_workers': num_workers,
@@ -454,15 +523,15 @@ def main():
 
     # Handle resume
     resume_checkpoint = None
-    start_epoch = 0
+    skip_shards: set[str] = set()
     if args.resume:
         resume_path = Path(args.resume)
         if resume_path.exists():
             resume_checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
-            start_epoch = resume_checkpoint.get('epoch', 0)
+            skip_shards = set(resume_checkpoint.get('completed_shards', []))
             if rank == 0:
                 print(f"Resuming from: {resume_path}")
-                print(f"  Starting from epoch {start_epoch + 1}")
+                print(f"  Skipping {len(skip_shards)} completed shards")
         else:
             if rank == 0:
                 print(f"Warning: Resume checkpoint not found: {resume_path}")
@@ -475,12 +544,16 @@ def main():
             print(f"Parquet files: {len(parquet_paths)} shards")
             samples_per_shard = get_samples_per_shard(parquet_paths)
             total_shards = len(parquet_paths)
+            remaining_shards = total_shards - len(skip_shards)
             print(f"Total shards: {total_shards} (~{samples_per_shard:,} samples/shard)")
+            if skip_shards:
+                print(f"Remaining shards: {remaining_shards}")
         dataset = PGNDataset.from_parquet(
             parquet_paths=parquet_paths,
             rank=rank,
             world_size=world_size,
             batch_size=batch_size,
+            skip_shards=skip_shards,
         )
     elif pgn_patterns:
         pgn_paths = expand_globs(pgn_patterns)
@@ -516,6 +589,8 @@ def main():
         model_to_load = model.module if is_distributed else model
         model_to_load.load_state_dict(resume_checkpoint['model_state_dict'])
         optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
+        if scaler is not None and 'scaler_state_dict' in resume_checkpoint:
+            scaler.load_state_dict(resume_checkpoint['scaler_state_dict'])
         if rank == 0:
             print("Loaded model and optimizer state from checkpoint")
 
@@ -555,55 +630,51 @@ def main():
         if args.max_batches is None:
             args.max_batches = wait_batches + warmup_batches + active_batches + 5
 
-    for epoch in range(start_epoch, epochs):
-        if rank == 0:
-            print(f"\nEpoch {epoch + 1}/{epochs}")
+    if rank == 0:
+        print(f"\nStarting training (checkpoint every {checkpoint_every_n_shards} shards)")
 
-        stats = train_epoch(
+    stats = train_epoch(
+        model=model,
+        dataloader=dataloader,
+        optimizer=optimizer,
+        device=device,
+        precision=precision,
+        scaler=scaler,
+        rank=rank,
+        world_size=world_size,
+        log_interval=log_interval,
+        total_shards=total_shards,
+        samples_per_shard=samples_per_shard,
+        use_wandb=use_wandb,
+        max_batches=args.max_batches,
+        profiler=profiler,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_every_n_shards=checkpoint_every_n_shards,
+        is_distributed=is_distributed,
+    )
+
+    if rank == 0:
+        print(f"\nTraining pass complete:")
+        print(f"  Loss: {stats['loss']:.4f}")
+        print(f"  Move accuracy: {stats['move_accuracy']*100:.1f}%")
+        if 'promo_accuracy' in stats:
+            print(f"  Promo accuracy: {stats['promo_accuracy']*100:.1f}%")
+        print(f"  Shards completed: {len(stats['completed_shards'])}")
+
+    # Save final checkpoint
+    completed_shards = stats['completed_shards']
+    if completed_shards:
+        final_checkpoint_path = checkpoint_dir / 'checkpoint_final.pt'
+        save_checkpoint(
+            path=final_checkpoint_path,
             model=model,
-            dataloader=dataloader,
             optimizer=optimizer,
-            device=device,
-            precision=precision,
             scaler=scaler,
+            completed_shards=completed_shards,
+            is_distributed=is_distributed,
             rank=rank,
             world_size=world_size,
-            log_interval=log_interval,
-            total_shards=total_shards,
-            samples_per_shard=samples_per_shard,
-            use_wandb=use_wandb,
-            max_batches=args.max_batches,
-            profiler=profiler,
         )
-
-        if rank == 0:
-            print(f"Epoch {epoch + 1} complete:")
-            print(f"  Loss: {stats['loss']:.4f}")
-            print(f"  Move accuracy: {stats['move_accuracy']*100:.1f}%")
-            if 'promo_accuracy' in stats:
-                print(f"  Promo accuracy: {stats['promo_accuracy']*100:.1f}%")
-
-            if use_wandb:
-                epoch_log = {
-                    'epoch': epoch + 1,
-                    'epoch/loss': stats['loss'],
-                    'epoch/move_accuracy': stats['move_accuracy'],
-                }
-                if 'promo_accuracy' in stats:
-                    epoch_log['epoch/promo_accuracy'] = stats['promo_accuracy']
-                wandb.log(epoch_log)
-
-            # Save end-of-epoch checkpoint
-            # epoch is 0-based, so epoch+1 marks "completed epoch 1, ready for epoch 2"
-            checkpoint_path = checkpoint_dir / f'epoch_{epoch + 1}.pt'
-            model_to_save = model.module if is_distributed else model
-            torch.save({
-                'epoch': epoch + 1,  # Next epoch to start from
-                'model_state_dict': model_to_save.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'stats': stats,
-            }, checkpoint_path)
-            print(f"  Saved checkpoint: {checkpoint_path}")
 
     if profiler is not None:
         profiler.stop()
