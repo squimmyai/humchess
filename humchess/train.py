@@ -30,7 +30,7 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
-from .data.pgn_dataset import PGNDataset
+from .data.pgn_dataset import PGNDataset, expand_s3_glob
 from .model.transformer import ChessTransformer
 
 
@@ -98,24 +98,49 @@ def load_config(path: Path) -> dict:
     return data
 
 
-def expand_globs(patterns: list[str]) -> list[Path]:
-    """Expand glob patterns and directories to file paths."""
-    paths = []
+def expand_globs(patterns: list[str]) -> list[Path | str]:
+    """Expand glob patterns and directories to file paths.
+
+    Supports both local paths and S3 URLs (s3://bucket/path/*.parquet).
+    Local paths are returned as Path objects, S3 URLs as strings.
+    """
+    paths: list[Path | str] = []
     for pattern in patterns:
-        p = Path(pattern)
-        if p.is_dir():
-            paths.extend(sorted(p.glob("*.parquet")))
-        elif '*' in pattern or '?' in pattern:
-            paths.extend(sorted(Path(m) for m in glob.glob(pattern)))
+        if pattern.startswith('s3://'):
+            # S3 URL - use S3 glob expansion
+            if '*' in pattern or '?' in pattern:
+                paths.extend(expand_s3_glob(pattern))
+            else:
+                paths.append(pattern)
         else:
-            paths.append(p)
+            # Local path
+            p = Path(pattern)
+            if p.is_dir():
+                paths.extend(sorted(p.glob("*.parquet")))
+            elif '*' in pattern or '?' in pattern:
+                paths.extend(sorted(Path(m) for m in glob.glob(pattern)))
+            else:
+                paths.append(p)
     return paths
 
 
-def get_samples_per_shard(paths: list[Path]) -> int:
-    """Get samples per shard by reading metadata from first file."""
+def get_samples_per_shard(paths: list[Path | str]) -> int:
+    """Get samples per shard by reading metadata from first file.
+
+    Supports both local paths and S3 URLs.
+    """
     import pyarrow.parquet as pq
-    return pq.ParquetFile(paths[0]).metadata.num_rows
+    from .data.pgn_dataset import _get_s3_filesystem, _parse_s3_path
+
+    first_path = str(paths[0])
+    if first_path.startswith('s3://'):
+        fs = _get_s3_filesystem()
+        bucket, key = _parse_s3_path(first_path)
+        # Use read_table for R2 compatibility (avoids range request issues)
+        table = pq.read_table(f"{bucket}/{key}", filesystem=fs)
+        return table.num_rows
+    else:
+        return pq.ParquetFile(paths[0]).metadata.num_rows
 
 
 def train_epoch(

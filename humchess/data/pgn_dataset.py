@@ -3,19 +3,115 @@ Streaming PGN dataset for training.
 
 Implements an IterableDataset that streams positions from PGN files,
 applying white normalization and computing legality masks on-the-fly.
+
+Supports S3-compatible storage (including Cloudflare R2) via PyArrow's S3FileSystem.
+Set environment variables:
+  - R2_ACCESS_KEY_ID: Access key
+  - R2_SECRET_ACCESS_KEY: Secret key
+  - R2_ENDPOINT_URL: Endpoint (e.g., https://<account>.r2.cloudflarestorage.com)
+
+Use s3:// URLs in config paths, e.g.:
+  parquet:
+    - s3://bucket-name/path/to/shards/*.parquet
 """
 
 import json
+import os
 import re
 import time
 from collections import OrderedDict
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterator, Optional
+from urllib.parse import urlparse
 
 import chess
 import chess.pgn
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
+
+
+def _get_s3_filesystem(endpoint_url: str | None = None):
+    """
+    Get a PyArrow S3FileSystem for the given endpoint.
+
+    Credentials are read from environment variables:
+      - R2_ACCESS_KEY_ID / AWS_ACCESS_KEY_ID
+      - R2_SECRET_ACCESS_KEY / AWS_SECRET_ACCESS_KEY
+      - R2_ENDPOINT_URL (if endpoint_url not provided)
+
+    Note: Not cached because each DataLoader worker process needs its own instance.
+    """
+    import pyarrow.fs as pafs
+
+    access_key = os.environ.get('R2_ACCESS_KEY_ID') or os.environ.get('AWS_ACCESS_KEY_ID')
+    secret_key = os.environ.get('R2_SECRET_ACCESS_KEY') or os.environ.get('AWS_SECRET_ACCESS_KEY')
+    endpoint = endpoint_url or os.environ.get('R2_ENDPOINT_URL')
+
+    if not access_key or not secret_key:
+        raise ValueError(
+            "S3 credentials not found. Set R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY "
+            "(or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY) environment variables."
+        )
+
+    # R2 and most S3-compatible storage require path-style addressing
+    # (bucket in path, not subdomain)
+    return pafs.S3FileSystem(
+        endpoint_override=endpoint,
+        access_key=access_key,
+        secret_key=secret_key,
+        force_virtual_addressing=False,  # Use path-style for R2 compatibility
+        request_timeout=30,
+        connect_timeout=10,
+    )
+
+
+def _parse_s3_path(path: str) -> tuple[str, str]:
+    """Parse s3://bucket/key into (bucket, key)."""
+    parsed = urlparse(path)
+    bucket = parsed.netloc
+    key = parsed.path.lstrip('/')
+    return bucket, key
+
+
+def expand_s3_glob(pattern: str) -> list[str]:
+    """
+    Expand an S3 glob pattern like s3://bucket/path/*.parquet.
+
+    Returns list of full s3:// URLs.
+    """
+    import pyarrow.fs as pafs
+
+    bucket, key_pattern = _parse_s3_path(pattern)
+    fs = _get_s3_filesystem()
+
+    # PyArrow's glob doesn't work on S3, so we list and filter
+    # Find the prefix before any glob characters
+    prefix_parts = []
+    for part in key_pattern.split('/'):
+        if '*' in part or '?' in part:
+            break
+        prefix_parts.append(part)
+    prefix = '/'.join(prefix_parts)
+
+    # List all files under prefix
+    selector = pafs.FileSelector(f"{bucket}/{prefix}", recursive=True)
+    try:
+        file_infos = fs.get_file_info(selector)
+    except Exception as e:
+        raise ValueError(f"Failed to list S3 path s3://{bucket}/{prefix}: {e}")
+
+    # Filter by glob pattern
+    import fnmatch
+    results = []
+    for info in file_infos:
+        if info.type == pafs.FileType.File:
+            # info.path is "bucket/key"
+            full_key = info.path[len(bucket) + 1:]  # Remove "bucket/" prefix
+            if fnmatch.fnmatch(full_key, key_pattern):
+                results.append(f"s3://{bucket}/{full_key}")
+
+    return sorted(results)
 
 from .tokenization import (
     SEQ_LENGTH, NUM_MOVE_CLASSES, NUM_HISTORY_PLIES, NO_MOVE_ID,
@@ -120,7 +216,11 @@ class PGNDataset(IterableDataset):
             end_game: End game index (exclusive) per PGN file.
         """
         self.pgn_paths = [Path(p) for p in pgn_paths or []]
-        self.parquet_paths = [Path(p) for p in parquet_paths or []]
+        # Keep S3 URLs as strings (Path mangles s3:// to s3:/)
+        self.parquet_paths: list[Path | str] = [
+            p if str(p).startswith('s3://') else Path(p)
+            for p in parquet_paths or []
+        ]
         self.min_elo = min_elo
         self.max_elo = max_elo
         self.skip_first_n_plies = skip_first_n_plies
@@ -174,7 +274,6 @@ class PGNDataset(IterableDataset):
             yield from self._iter_pgn(path, worker_info, shard_by_game)
 
     def _iter_parquet(self, worker_info) -> Iterator[dict]:
-        import numpy as np
         import pyarrow.parquet as pq
 
         # Two-level sharding: by DDP rank first, then by DataLoader worker
@@ -197,27 +296,47 @@ class PGNDataset(IterableDataset):
                 if i % worker_info.num_workers == worker_info.id
             ]
 
+        # Check if using S3 paths (check first path, assume all are same type)
+        use_s3 = paths and str(paths[0]).startswith('s3://')
+        fs = _get_s3_filesystem() if use_s3 else None
+
         for path in paths:
-            parquet_file = pq.ParquetFile(path)
-            for batch in parquet_file.iter_batches(batch_size=self._batch_size):
-                # Vectorized conversion - much faster than row-by-row
-                tokens = torch.from_numpy(np.array(batch.column("tokens").to_pylist(), dtype=np.int64))
-                move_ids = torch.from_numpy(batch.column("move_id").to_numpy().astype(np.int64))
-                promo_ids = torch.from_numpy(batch.column("promo_id").to_numpy().astype(np.int64))
-                is_promos = torch.from_numpy(batch.column("is_promotion").to_numpy(zero_copy_only=False))
+            path_str = str(path)
+            if use_s3:
+                # For S3, strip the s3:// prefix - PyArrow expects "bucket/key"
+                bucket, key = _parse_s3_path(path_str)
+                # Use read_table for R2 compatibility (avoids range request issues)
+                table = pq.read_table(f"{bucket}/{key}", filesystem=fs)
+                for i in range(0, table.num_rows, self._batch_size):
+                    batch = table.slice(i, min(self._batch_size, table.num_rows - i))
+                    yield from self._process_parquet_batch(batch)
+            else:
+                parquet_file = pq.ParquetFile(path)
+                for batch in parquet_file.iter_batches(batch_size=self._batch_size):
+                    yield from self._process_parquet_batch(batch)
 
-                # Vectorized legal mask unpacking
-                mask_bytes_list = batch.column("legal_mask").to_pylist()
-                legal_masks = _unpack_legal_masks_batch(mask_bytes_list)
+    def _process_parquet_batch(self, batch) -> Iterator[dict]:
+        """Process a single parquet batch into training samples."""
+        import numpy as np
 
-                # Yield pre-batched dict
-                yield {
-                    'tokens': tokens,
-                    'move_id': move_ids,
-                    'promo_id': promo_ids,
-                    'legal_mask': legal_masks,
-                    'is_promotion': is_promos,
-                }
+        # Vectorized conversion - much faster than row-by-row
+        tokens = torch.from_numpy(np.array(batch.column("tokens").to_pylist(), dtype=np.int64))
+        move_ids = torch.from_numpy(batch.column("move_id").to_numpy().astype(np.int64))
+        promo_ids = torch.from_numpy(batch.column("promo_id").to_numpy().astype(np.int64))
+        is_promos = torch.from_numpy(batch.column("is_promotion").to_numpy(zero_copy_only=False))
+
+        # Vectorized legal mask unpacking
+        mask_bytes_list = batch.column("legal_mask").to_pylist()
+        legal_masks = _unpack_legal_masks_batch(mask_bytes_list)
+
+        # Yield pre-batched dict
+        yield {
+            'tokens': tokens,
+            'move_id': move_ids,
+            'promo_id': promo_ids,
+            'legal_mask': legal_masks,
+            'is_promotion': is_promos,
+        }
                     
     def _iter_pgn(self, path: Path, worker_info, shard_by_game: bool) -> Iterator[dict]:
         """Iterate over all positions in a single PGN file."""

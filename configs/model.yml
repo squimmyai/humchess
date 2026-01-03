@@ -6,8 +6,14 @@ model:
 
 data:
   # Parquet shards - supports globs and directories
+  # Can use local paths or S3 URLs (for R2/S3 storage)
+  #
+  # For S3/R2, set environment variables:
+  #   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT_URL
+  # Then use s3:// URLs:
+  #   - s3://bucket-name/path/to/shards/*.parquet
   parquet:
-    - /teamspace/r2_connections/cloudflare/tokenized-2022-01/*.parquet
+    - s3://lightning-ai-storage/tokenized-2022-01/*.parquet
   # PGN files (alternative to parquet, slower)
   # pgn:
   #   - data/*.pgn
@@ -16,7 +22,7 @@ data:
 
 training:
   checkpoint_dir: checkpoints
-  batch_size: 7000
+  batch_size: 3000
   lr: 1e-4
   epochs: 1
   num_workers: 12
