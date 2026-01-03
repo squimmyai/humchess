@@ -325,31 +325,58 @@ class PGNDataset(IterableDataset):
                 for i in range(0, num_rows, self._batch_size):
                     batch = table.slice(i, min(self._batch_size, num_rows - i))
                     is_last_batch = (i + self._batch_size >= num_rows)
-                    for result in self._process_parquet_batch(batch):
-                        result['shard_path'] = path_str
-                        result['shard_complete'] = is_last_batch
-                        yield result
+                    try:
+                        for result in self._process_parquet_batch(batch):
+                            result['shard_path'] = path_str
+                            result['shard_complete'] = is_last_batch
+                            yield result
+                    except ValueError as e:
+                        raise ValueError(f"{e} (shard: {path_str}, batch offset: {i})") from e
             else:
                 parquet_file = pq.ParquetFile(path)
                 num_rows = parquet_file.metadata.num_rows
                 rows_yielded = 0
                 for batch in parquet_file.iter_batches(batch_size=self._batch_size):
+                    batch_offset = rows_yielded
                     rows_yielded += batch.num_rows
                     is_last_batch = (rows_yielded >= num_rows)
-                    for result in self._process_parquet_batch(batch):
-                        result['shard_path'] = path_str
-                        result['shard_complete'] = is_last_batch
-                        yield result
+                    try:
+                        for result in self._process_parquet_batch(batch):
+                            result['shard_path'] = path_str
+                            result['shard_complete'] = is_last_batch
+                            yield result
+                    except ValueError as e:
+                        raise ValueError(f"{e} (shard: {path_str}, batch offset: {batch_offset})") from e
 
     def _process_parquet_batch(self, batch) -> Iterator[dict]:
         """Process a single parquet batch into training samples."""
         import numpy as np
 
-        # Vectorized conversion - much faster than row-by-row
-        tokens = torch.from_numpy(np.array(batch.column("tokens").to_pylist(), dtype=np.int64))
+        # Convert tokens - check for jagged arrays (rows with different lengths)
+        tokens_list = batch.column("tokens").to_pylist()
+        token_lens = [len(t) for t in tokens_list]
+        if not all(l == SEQ_LENGTH for l in token_lens):
+            bad_idx = next(i for i, l in enumerate(token_lens) if l != SEQ_LENGTH)
+            raise ValueError(f"Corrupt parquet: row {bad_idx} has {token_lens[bad_idx]} tokens, expected {SEQ_LENGTH}")
+
+        tokens = torch.from_numpy(np.array(tokens_list, dtype=np.int64))
         move_ids = torch.from_numpy(batch.column("move_id").to_numpy().astype(np.int64))
         promo_ids = torch.from_numpy(batch.column("promo_id").to_numpy().astype(np.int64))
         is_promos = torch.from_numpy(batch.column("is_promotion").to_numpy(zero_copy_only=False))
+
+        # Validate token ranges - catches corrupt parquet data
+        board_tokens = tokens[:, :68]
+        history_tokens = tokens[:, 68:74]
+        if (board_tokens < 0).any() or (board_tokens >= 66).any():
+            bad_mask = (board_tokens < 0) | (board_tokens >= 66)
+            bad_idx = bad_mask.nonzero()
+            raise ValueError(f"Corrupt parquet: invalid board token at row {bad_idx[0, 0].item()}, "
+                           f"col {bad_idx[0, 1].item()}, value {board_tokens[bad_idx[0, 0], bad_idx[0, 1]].item()}")
+        if (history_tokens < 0).any() or (history_tokens > NO_MOVE_ID).any():
+            bad_mask = (history_tokens < 0) | (history_tokens > NO_MOVE_ID)
+            bad_idx = bad_mask.nonzero()
+            raise ValueError(f"Corrupt parquet: invalid history token at row {bad_idx[0, 0].item()}, "
+                           f"col {bad_idx[0, 1].item()}, value {history_tokens[bad_idx[0, 0], bad_idx[0, 1]].item()}")
 
         # Vectorized legal mask unpacking
         mask_bytes_list = batch.column("legal_mask").to_pylist()
