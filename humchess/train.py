@@ -151,6 +151,7 @@ def train_epoch(
     precision: str,
     scaler: torch.cuda.amp.GradScaler | None,
     rank: int = 0,
+    world_size: int = 1,
     log_interval: int = 100,
     total_shards: int | None = None,
     samples_per_shard: int | None = None,
@@ -240,55 +241,62 @@ def train_epoch(
             total_promo_loss_t += promo_loss.detach() * num_promos
 
         # Logging - only sync at log intervals
-        if rank == 0 and (batch_idx + 1) % log_interval == 0:
-            # Single sync point: pull all stats from GPU
-            total_samples = total_samples_t.item()
-            total_loss = total_loss_t.item()
-            total_move_loss = total_move_loss_t.item()
-            total_correct = total_correct_t.item()
-            total_promo_samples = total_promo_samples_t.item()
-            total_promo_correct = total_promo_correct_t.item()
-            total_promo_loss = total_promo_loss_t.item()
+        if (batch_idx + 1) % log_interval == 0:
+            # Reduce sample count across all ranks for accurate global throughput
+            global_samples_t = total_samples_t.clone()
+            if world_size > 1:
+                dist.all_reduce(global_samples_t, op=dist.ReduceOp.SUM)
 
-            elapsed = time.time() - start_time
-            samples_per_sec = total_samples / elapsed
-            avg_loss = total_loss / total_samples
-            move_acc = total_correct / total_samples * 100
+            if rank == 0:
+                # Single sync point: pull all stats from GPU
+                global_samples = global_samples_t.item()
+                total_samples = total_samples_t.item()
+                total_loss = total_loss_t.item()
+                total_move_loss = total_move_loss_t.item()
+                total_correct = total_correct_t.item()
+                total_promo_samples = total_promo_samples_t.item()
+                total_promo_correct = total_promo_correct_t.item()
+                total_promo_loss = total_promo_loss_t.item()
 
-            progress_str = ""
-            if total_shards and samples_per_shard:
-                shards_done = total_samples / samples_per_shard
-                pct = shards_done / total_shards * 100
-                remaining_shards = total_shards - shards_done
-                remaining_samples = remaining_shards * samples_per_shard
-                eta_sec = remaining_samples / samples_per_sec if samples_per_sec > 0 else 0
-                eta_min = eta_sec / 60
-                if eta_min >= 60:
-                    eta_str = f"{eta_min/60:.1f}h"
-                else:
-                    eta_str = f"{eta_min:.1f}m"
-                progress_str = f" | shard ~{shards_done:.1f}/{total_shards} ({pct:.1f}%) ETA {eta_str}"
+                elapsed = time.time() - start_time
+                samples_per_sec = global_samples / elapsed
+                avg_loss = total_loss / total_samples
+                move_acc = total_correct / total_samples * 100
 
-            print(f"  Batch {batch_idx + 1}: loss={avg_loss:.4f}, "
-                  f"move_acc={move_acc:.1f}%, "
-                  f"speed={samples_per_sec:.0f} samples/s{progress_str}")
-
-            if use_wandb:
-                log_dict = {
-                    'train/loss': avg_loss,
-                    'train/move_loss': total_move_loss / total_samples,
-                    'train/move_accuracy': total_correct / total_samples,
-                    'train/samples_per_sec': samples_per_sec,
-                    'train/samples': total_samples,
-                }
+                progress_str = ""
                 if total_shards and samples_per_shard:
-                    shards_done = total_samples / samples_per_shard
-                    log_dict['train/shards_done'] = shards_done
-                    log_dict['train/progress_pct'] = shards_done / total_shards * 100
-                if total_promo_samples > 0:
-                    log_dict['train/promo_loss'] = total_promo_loss / total_promo_samples
-                    log_dict['train/promo_accuracy'] = total_promo_correct / total_promo_samples
-                wandb.log(log_dict)
+                    shards_done = global_samples / samples_per_shard
+                    pct = shards_done / total_shards * 100
+                    remaining_shards = total_shards - shards_done
+                    remaining_samples = remaining_shards * samples_per_shard
+                    eta_sec = remaining_samples / samples_per_sec if samples_per_sec > 0 else 0
+                    eta_min = eta_sec / 60
+                    if eta_min >= 60:
+                        eta_str = f"{eta_min/60:.1f}h"
+                    else:
+                        eta_str = f"{eta_min:.1f}m"
+                    progress_str = f" | shard ~{shards_done:.1f}/{total_shards} ({pct:.1f}%) ETA {eta_str}"
+
+                print(f"  Batch {batch_idx + 1}: loss={avg_loss:.4f}, "
+                      f"move_acc={move_acc:.1f}%, "
+                      f"speed={samples_per_sec:.0f} samples/s{progress_str}")
+
+                if use_wandb:
+                    log_dict = {
+                        'train/loss': avg_loss,
+                        'train/move_loss': total_move_loss / total_samples,
+                        'train/move_accuracy': total_correct / total_samples,
+                        'train/samples_per_sec': samples_per_sec,
+                        'train/samples': global_samples,
+                    }
+                    if total_shards and samples_per_shard:
+                        shards_done = global_samples / samples_per_shard
+                        log_dict['train/shards_done'] = shards_done
+                        log_dict['train/progress_pct'] = shards_done / total_shards * 100
+                    if total_promo_samples > 0:
+                        log_dict['train/promo_loss'] = total_promo_loss / total_promo_samples
+                        log_dict['train/promo_accuracy'] = total_promo_correct / total_promo_samples
+                    wandb.log(log_dict)
 
         # Step profiler
         if profiler is not None:
@@ -438,9 +446,7 @@ def main():
         scaler = torch.cuda.amp.GradScaler()
 
     if is_distributed:
-        # find_unused_parameters=True needed because promo_head is unused
-        # when batch has no promotions
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank])
 
     # Create dataset
     parquet_patterns = data_cfg.get('parquet', [])
@@ -468,9 +474,8 @@ def main():
         if rank == 0:
             print(f"Parquet files: {len(parquet_paths)} shards")
             samples_per_shard = get_samples_per_shard(parquet_paths)
-            # Each rank sees ~1/world_size of the shards
-            total_shards = len(parquet_paths) // world_size
-            print(f"Total shards: {len(parquet_paths)} ({total_shards} per rank, ~{samples_per_shard:,} samples/shard)")
+            total_shards = len(parquet_paths)
+            print(f"Total shards: {total_shards} (~{samples_per_shard:,} samples/shard)")
         dataset = PGNDataset.from_parquet(
             parquet_paths=parquet_paths,
             rank=rank,
@@ -562,6 +567,7 @@ def main():
             precision=precision,
             scaler=scaler,
             rank=rank,
+            world_size=world_size,
             log_interval=log_interval,
             total_shards=total_shards,
             samples_per_shard=samples_per_shard,
