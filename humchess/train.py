@@ -197,6 +197,7 @@ def train_epoch(
     checkpoint_dir: Path | None = None,
     checkpoint_every_n_shards: int | None = None,
     is_distributed: bool = False,
+    initial_completed_shards: set[str] | None = None,
 ) -> dict:
     """Train for one epoch."""
     model.train()
@@ -210,9 +211,9 @@ def train_epoch(
     total_promo_samples_t = torch.tensor(0, device=device, dtype=torch.long)
     total_promo_correct_t = torch.tensor(0, device=device, dtype=torch.long)
 
-    # Shard-based checkpointing
-    completed_shards: set[str] = set()
-    last_checkpoint_shard_count = 0
+    # Shard-based checkpointing (include previously completed shards from resume)
+    completed_shards: set[str] = set(initial_completed_shards or [])
+    last_checkpoint_shard_count = len(completed_shards)
 
     start_time = time.time()
 
@@ -284,7 +285,8 @@ def train_epoch(
             total_promo_loss_t += promo_loss.detach() * num_promos
 
         # Track completed shards for checkpointing
-        if batch.get('shard_complete', False):
+        shard_complete = batch.get('shard_complete', False)
+        if shard_complete:
             shard_path = batch.get('shard_path')
             if shard_path:
                 completed_shards.add(shard_path)
@@ -442,14 +444,14 @@ def main():
     data_cfg = config.get('data', {})
     train_cfg = config.get('training', {})
 
-    # Apply CLI overrides
-    batch_size = args.batch_size or train_cfg.get('batch_size', 256)
-    lr = args.lr or float(train_cfg.get('lr', 1e-4))
-    num_workers = args.num_workers or train_cfg.get('num_workers', 4)
+    # Apply CLI overrides (use 'is not None' for values where 0 is valid)
+    batch_size = args.batch_size if args.batch_size is not None else train_cfg.get('batch_size', 256)
+    lr = args.lr if args.lr is not None else float(train_cfg.get('lr', 1e-4))
+    num_workers = args.num_workers if args.num_workers is not None else train_cfg.get('num_workers', 4)
     checkpoint_dir = Path(args.checkpoint_dir or train_cfg.get('checkpoint_dir', 'checkpoints'))
     precision = args.precision or train_cfg.get('precision', 'bf16')
     log_interval = train_cfg.get('log_interval', 100)
-    checkpoint_every_n_shards = args.checkpoint_every_n_shards or train_cfg.get('checkpoint_every_n_shards', 100)
+    checkpoint_every_n_shards = args.checkpoint_every_n_shards if args.checkpoint_every_n_shards is not None else train_cfg.get('checkpoint_every_n_shards', 100)
 
     # Setup distributed
     rank, world_size, local_rank, is_distributed = setup_distributed()
@@ -651,6 +653,7 @@ def main():
         checkpoint_dir=checkpoint_dir,
         checkpoint_every_n_shards=checkpoint_every_n_shards,
         is_distributed=is_distributed,
+        initial_completed_shards=skip_shards,
     )
 
     if rank == 0:
