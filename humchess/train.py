@@ -676,7 +676,12 @@ def main():
             print(f"  Promo accuracy: {stats['promo_accuracy']*100:.1f}%")
         print(f"  Shards completed: {len(stats['completed_shards'])}")
 
-    # Save final checkpoint
+    # Barrier to ensure all ranks finish training before checkpointing
+    # (needed because shards may have different row counts)
+    if is_distributed:
+        dist.barrier()
+
+    # Save final checkpoint (all ranks must call due to all_gather_object inside)
     completed_shards = stats['completed_shards']
     if completed_shards:
         final_checkpoint_path = checkpoint_dir / 'checkpoint_final.pt'
