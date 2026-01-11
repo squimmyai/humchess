@@ -153,10 +153,17 @@ def save_checkpoint(
     is_distributed: bool,
     rank: int = 0,
     world_size: int = 1,
+    gather_shards: bool = True,
 ) -> None:
-    """Save checkpoint with model, optimizer, and completed shards."""
-    # Gather completed shards from all ranks
-    if is_distributed and world_size > 1:
+    """Save checkpoint with model, optimizer, and completed shards.
+
+    Args:
+        gather_shards: If True, gather completed_shards from all ranks (requires
+            all ranks to call this function). If False, only rank 0 saves using
+            its local completed_shards (safe for mid-epoch checkpoints).
+    """
+    # Gather completed shards from all ranks (only if requested and distributed)
+    if gather_shards and is_distributed and world_size > 1:
         all_completed: list[list[str]] = [None] * world_size
         dist.all_gather_object(all_completed, list(completed_shards))
         # Flatten into single set
@@ -199,6 +206,7 @@ def train_epoch(
     checkpoint_every_n_shards: int | None = None,
     is_distributed: bool = False,
     initial_completed_shards: set[str] | None = None,
+    debug_batches: bool = False,
 ) -> dict:
     """Train for one epoch."""
     model.train()
@@ -214,7 +222,8 @@ def train_epoch(
 
     # Shard-based checkpointing (include previously completed shards from resume)
     completed_shards: set[str] = set(initial_completed_shards or [])
-    last_checkpoint_shard_count = len(completed_shards)
+    initial_shard_count = len(completed_shards)  # For computing new shards in all_reduce
+    last_checkpoint_shard_count = initial_shard_count
 
     start_time = time.time()
 
@@ -230,16 +239,14 @@ def train_epoch(
             legal_mask = batch['legal_mask'].to(device, non_blocking=True)
             is_promotion = batch['is_promotion'].to(device, non_blocking=True)
 
-            # Log batch info for debugging crashes
-            # Every batch: log to stderr with CUDA sync to ensure order
-            shard_path = batch.get('shard_path', 'unknown')
-            shard_name = shard_path.split('/')[-1] if isinstance(shard_path, str) and '/' in shard_path else shard_path
-
-            # Sync CUDA before logging to ensure previous batch completed
-            if device.type == 'cuda':
-                torch.cuda.synchronize(device)
-
-            print(f"[BATCH] rank={rank} batch={batch_idx} shard={shard_name}", file=sys.stderr, flush=True)
+            # Debug logging (gated behind --debug-batches flag due to perf impact)
+            if debug_batches:
+                shard_path = batch.get('shard_path', 'unknown')
+                shard_name = shard_path.split('/')[-1] if isinstance(shard_path, str) and '/' in shard_path else shard_path
+                # Sync CUDA before logging to ensure previous batch completed
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                print(f"[BATCH] rank={rank} batch={batch_idx} shard={shard_name}", file=sys.stderr, flush=True)
 
             # Forward pass
             if precision == 'bf16':
@@ -308,11 +315,24 @@ def train_epoch(
                 if shard_path:
                     completed_shards.add(shard_path)
 
-                    # Checkpoint every N shards
-                    if (checkpoint_every_n_shards is not None
-                        and checkpoint_dir is not None
-                        and len(completed_shards) >= last_checkpoint_shard_count + checkpoint_every_n_shards):
-                        checkpoint_path = checkpoint_dir / f'checkpoint_shards_{len(completed_shards)}.pt'
+            # Logging and checkpointing - only sync at log intervals
+            if (batch_idx + 1) % log_interval == 0:
+                # Reduce sample count across all ranks for accurate global throughput
+                global_samples_t = total_samples_t.clone()
+                if world_size > 1:
+                    dist.all_reduce(global_samples_t, op=dist.ReduceOp.SUM)
+
+                # Checkpoint based on global shard count (all ranks sync here)
+                if checkpoint_every_n_shards is not None and checkpoint_dir is not None:
+                    # Only count NEW shards (exclude initial to avoid double-counting on resume)
+                    local_new_shards = torch.tensor(len(completed_shards) - initial_shard_count, device=device)
+                    if world_size > 1:
+                        dist.all_reduce(local_new_shards, op=dist.ReduceOp.SUM)
+                    global_shard_count = initial_shard_count + local_new_shards.item()
+
+                    # All ranks see same global_shard_count, make same decision
+                    if global_shard_count >= last_checkpoint_shard_count + checkpoint_every_n_shards:
+                        checkpoint_path = checkpoint_dir / f'checkpoint_shards_{int(global_shard_count)}.pt'
                         save_checkpoint(
                             path=checkpoint_path,
                             model=model,
@@ -322,15 +342,9 @@ def train_epoch(
                             is_distributed=is_distributed,
                             rank=rank,
                             world_size=world_size,
+                            gather_shards=True,
                         )
-                        last_checkpoint_shard_count = len(completed_shards)
-
-            # Logging - only sync at log intervals
-            if (batch_idx + 1) % log_interval == 0:
-                # Reduce sample count across all ranks for accurate global throughput
-                global_samples_t = total_samples_t.clone()
-                if world_size > 1:
-                    dist.all_reduce(global_samples_t, op=dist.ReduceOp.SUM)
+                        last_checkpoint_shard_count = global_shard_count
 
                 if rank == 0:
                     # Single sync point: pull all stats from GPU
@@ -450,6 +464,8 @@ def main():
                         help='Enable torch.profiler (outputs Chrome trace)')
     parser.add_argument('--profile-batches', type=int, default=20,
                         help='Number of batches to profile (default: 20)')
+    parser.add_argument('--debug-batches', action='store_true',
+                        help='Log every batch with CUDA sync (slow, for debugging crashes)')
     args = parser.parse_args()
 
     # Load config
@@ -671,6 +687,7 @@ def main():
         checkpoint_every_n_shards=checkpoint_every_n_shards,
         is_distributed=is_distributed,
         initial_completed_shards=skip_shards,
+        debug_batches=args.debug_batches,
     )
 
     if rank == 0:
