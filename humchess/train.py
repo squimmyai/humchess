@@ -218,175 +218,180 @@ def train_epoch(
 
     start_time = time.time()
 
-    for batch_idx, batch in enumerate(dataloader):
-        tokens = batch['tokens'].to(device, non_blocking=True)
-        move_targets = batch['move_id'].to(device, non_blocking=True)
-        promo_targets = batch['promo_id'].to(device, non_blocking=True)
-        legal_mask = batch['legal_mask'].to(device, non_blocking=True)
-        is_promotion = batch['is_promotion'].to(device, non_blocking=True)
+    # Use join() context for DDP to handle uneven batch counts across ranks
+    # (ranks that finish early become "shadow" participants in collectives)
+    join_ctx = model.join() if is_distributed else nullcontext()
 
-        # Log batch info for debugging crashes
-        # Every batch: log to stderr with CUDA sync to ensure order
-        shard_path = batch.get('shard_path', 'unknown')
-        shard_name = shard_path.split('/')[-1] if isinstance(shard_path, str) and '/' in shard_path else shard_path
+    with join_ctx:
+        for batch_idx, batch in enumerate(dataloader):
+            tokens = batch['tokens'].to(device, non_blocking=True)
+            move_targets = batch['move_id'].to(device, non_blocking=True)
+            promo_targets = batch['promo_id'].to(device, non_blocking=True)
+            legal_mask = batch['legal_mask'].to(device, non_blocking=True)
+            is_promotion = batch['is_promotion'].to(device, non_blocking=True)
 
-        # Sync CUDA before logging to ensure previous batch completed
-        if device.type == 'cuda':
-            torch.cuda.synchronize(device)
+            # Log batch info for debugging crashes
+            # Every batch: log to stderr with CUDA sync to ensure order
+            shard_path = batch.get('shard_path', 'unknown')
+            shard_name = shard_path.split('/')[-1] if isinstance(shard_path, str) and '/' in shard_path else shard_path
 
-        print(f"[BATCH] rank={rank} batch={batch_idx} shard={shard_name}", file=sys.stderr, flush=True)
+            # Sync CUDA before logging to ensure previous batch completed
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
 
-        # Forward pass
-        if precision == 'bf16':
-            autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16)
-        elif precision == 'fp16':
-            autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
-        else:
-            autocast_ctx = nullcontext()
+            print(f"[BATCH] rank={rank} batch={batch_idx} shard={shard_name}", file=sys.stderr, flush=True)
 
-        with autocast_ctx:
-            outputs = model(tokens)
-            move_logits = outputs['move_logits']
-            promo_logits = outputs['promo_logits']
+            # Forward pass
+            if precision == 'bf16':
+                autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+            elif precision == 'fp16':
+                autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
+            else:
+                autocast_ctx = nullcontext()
 
-            # Move loss (always computed)
-            move_loss = masked_cross_entropy(move_logits, move_targets, legal_mask)
+            with autocast_ctx:
+                outputs = model(tokens)
+                move_logits = outputs['move_logits']
+                promo_logits = outputs['promo_logits']
 
-            # Promotion loss (only for promotion moves)
-            # Clamp targets to valid range to avoid CUDA errors, then mask out non-promos
-            safe_promo_targets = promo_targets.clamp(0, 3)
-            promo_loss_per_sample = nn.functional.cross_entropy(
-                promo_logits,
-                safe_promo_targets,
-                reduction='none',
-            )
-            # Mask to zero for non-promotions and average over actual promotions
-            num_promos = is_promotion.sum().clamp(min=1)
-            promo_loss = (promo_loss_per_sample * is_promotion.float()).sum() / num_promos
+                # Move loss (always computed)
+                move_loss = masked_cross_entropy(move_logits, move_targets, legal_mask)
 
-            # Total loss
-            loss = move_loss + promo_loss
+                # Promotion loss (only for promotion moves)
+                # Clamp targets to valid range to avoid CUDA errors, then mask out non-promos
+                safe_promo_targets = promo_targets.clamp(0, 3)
+                promo_loss_per_sample = nn.functional.cross_entropy(
+                    promo_logits,
+                    safe_promo_targets,
+                    reduction='none',
+                )
+                # Mask to zero for non-promotions and average over actual promotions
+                num_promos = is_promotion.sum().clamp(min=1)
+                promo_loss = (promo_loss_per_sample * is_promotion.float()).sum() / num_promos
 
-        # Backward pass
-        optimizer.zero_grad()
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            optimizer.step()
+                # Total loss
+                loss = move_loss + promo_loss
 
-        # Stats - accumulate on GPU (no sync!)
-        batch_size = tokens.size(0)
-        with torch.no_grad():
-            num_promos = is_promotion.sum()
-            total_loss_t += loss.detach() * batch_size
-            total_move_loss_t += move_loss.detach() * batch_size
-            total_samples_t += batch_size
+            # Backward pass
+            optimizer.zero_grad()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
-            # Move accuracy (with masking)
-            masked_logits = move_logits.masked_fill(~legal_mask, float('-inf'))
-            preds = masked_logits.argmax(dim=-1)
-            total_correct_t += (preds == move_targets).sum()
+            # Stats - accumulate on GPU (no sync!)
+            batch_size = tokens.size(0)
+            with torch.no_grad():
+                num_promos = is_promotion.sum()
+                total_loss_t += loss.detach() * batch_size
+                total_move_loss_t += move_loss.detach() * batch_size
+                total_samples_t += batch_size
 
-            # Promotion accuracy - accumulate without sync
-            promo_preds = promo_logits.argmax(dim=-1)
-            total_promo_correct_t += ((promo_preds == promo_targets) & is_promotion).sum()
-            total_promo_samples_t += num_promos
-            total_promo_loss_t += promo_loss.detach() * num_promos
+                # Move accuracy (with masking)
+                masked_logits = move_logits.masked_fill(~legal_mask, float('-inf'))
+                preds = masked_logits.argmax(dim=-1)
+                total_correct_t += (preds == move_targets).sum()
 
-        # Track completed shards for checkpointing
-        shard_complete = batch.get('shard_complete', False)
-        if shard_complete:
-            shard_path = batch.get('shard_path')
-            if shard_path:
-                completed_shards.add(shard_path)
+                # Promotion accuracy - accumulate without sync
+                promo_preds = promo_logits.argmax(dim=-1)
+                total_promo_correct_t += ((promo_preds == promo_targets) & is_promotion).sum()
+                total_promo_samples_t += num_promos
+                total_promo_loss_t += promo_loss.detach() * num_promos
 
-                # Checkpoint every N shards
-                if (checkpoint_every_n_shards is not None
-                    and checkpoint_dir is not None
-                    and len(completed_shards) >= last_checkpoint_shard_count + checkpoint_every_n_shards):
-                    checkpoint_path = checkpoint_dir / f'checkpoint_shards_{len(completed_shards)}.pt'
-                    save_checkpoint(
-                        path=checkpoint_path,
-                        model=model,
-                        optimizer=optimizer,
-                        scaler=scaler,
-                        completed_shards=completed_shards,
-                        is_distributed=is_distributed,
-                        rank=rank,
-                        world_size=world_size,
-                    )
-                    last_checkpoint_shard_count = len(completed_shards)
+            # Track completed shards for checkpointing
+            shard_complete = batch.get('shard_complete', False)
+            if shard_complete:
+                shard_path = batch.get('shard_path')
+                if shard_path:
+                    completed_shards.add(shard_path)
 
-        # Logging - only sync at log intervals
-        if (batch_idx + 1) % log_interval == 0:
-            # Reduce sample count across all ranks for accurate global throughput
-            global_samples_t = total_samples_t.clone()
-            if world_size > 1:
-                dist.all_reduce(global_samples_t, op=dist.ReduceOp.SUM)
+                    # Checkpoint every N shards
+                    if (checkpoint_every_n_shards is not None
+                        and checkpoint_dir is not None
+                        and len(completed_shards) >= last_checkpoint_shard_count + checkpoint_every_n_shards):
+                        checkpoint_path = checkpoint_dir / f'checkpoint_shards_{len(completed_shards)}.pt'
+                        save_checkpoint(
+                            path=checkpoint_path,
+                            model=model,
+                            optimizer=optimizer,
+                            scaler=scaler,
+                            completed_shards=completed_shards,
+                            is_distributed=is_distributed,
+                            rank=rank,
+                            world_size=world_size,
+                        )
+                        last_checkpoint_shard_count = len(completed_shards)
 
-            if rank == 0:
-                # Single sync point: pull all stats from GPU
-                global_samples = global_samples_t.item()
-                total_samples = total_samples_t.item()
-                total_loss = total_loss_t.item()
-                total_move_loss = total_move_loss_t.item()
-                total_correct = total_correct_t.item()
-                total_promo_samples = total_promo_samples_t.item()
-                total_promo_correct = total_promo_correct_t.item()
-                total_promo_loss = total_promo_loss_t.item()
+            # Logging - only sync at log intervals
+            if (batch_idx + 1) % log_interval == 0:
+                # Reduce sample count across all ranks for accurate global throughput
+                global_samples_t = total_samples_t.clone()
+                if world_size > 1:
+                    dist.all_reduce(global_samples_t, op=dist.ReduceOp.SUM)
 
-                elapsed = time.time() - start_time
-                samples_per_sec = global_samples / elapsed
-                avg_loss = total_loss / total_samples
-                move_acc = total_correct / total_samples * 100
+                if rank == 0:
+                    # Single sync point: pull all stats from GPU
+                    global_samples = global_samples_t.item()
+                    total_samples = total_samples_t.item()
+                    total_loss = total_loss_t.item()
+                    total_move_loss = total_move_loss_t.item()
+                    total_correct = total_correct_t.item()
+                    total_promo_samples = total_promo_samples_t.item()
+                    total_promo_correct = total_promo_correct_t.item()
+                    total_promo_loss = total_promo_loss_t.item()
 
-                progress_str = ""
-                if total_shards and samples_per_shard:
-                    shards_done = global_samples / samples_per_shard
-                    pct = shards_done / total_shards * 100
-                    remaining_shards = total_shards - shards_done
-                    remaining_samples = remaining_shards * samples_per_shard
-                    eta_sec = remaining_samples / samples_per_sec if samples_per_sec > 0 else 0
-                    eta_min = eta_sec / 60
-                    if eta_min >= 60:
-                        eta_str = f"{eta_min/60:.1f}h"
-                    else:
-                        eta_str = f"{eta_min:.1f}m"
-                    progress_str = f" | shard ~{shards_done:.1f}/{total_shards} ({pct:.1f}%) ETA {eta_str}"
+                    elapsed = time.time() - start_time
+                    samples_per_sec = global_samples / elapsed
+                    avg_loss = total_loss / total_samples
+                    move_acc = total_correct / total_samples * 100
 
-                print(f"  Batch {batch_idx + 1}: loss={avg_loss:.4f}, "
-                      f"move_acc={move_acc:.1f}%, "
-                      f"speed={samples_per_sec:.0f} samples/s{progress_str}")
-
-                if use_wandb:
-                    log_dict = {
-                        'train/loss': avg_loss,
-                        'train/move_loss': total_move_loss / total_samples,
-                        'train/move_accuracy': total_correct / total_samples,
-                        'train/samples_per_sec': samples_per_sec,
-                        'train/samples': global_samples,
-                    }
+                    progress_str = ""
                     if total_shards and samples_per_shard:
                         shards_done = global_samples / samples_per_shard
-                        log_dict['train/shards_done'] = shards_done
-                        log_dict['train/progress_pct'] = shards_done / total_shards * 100
-                    if total_promo_samples > 0:
-                        log_dict['train/promo_loss'] = total_promo_loss / total_promo_samples
-                        log_dict['train/promo_accuracy'] = total_promo_correct / total_promo_samples
-                    wandb.log(log_dict)
+                        pct = shards_done / total_shards * 100
+                        remaining_shards = total_shards - shards_done
+                        remaining_samples = remaining_shards * samples_per_shard
+                        eta_sec = remaining_samples / samples_per_sec if samples_per_sec > 0 else 0
+                        eta_min = eta_sec / 60
+                        if eta_min >= 60:
+                            eta_str = f"{eta_min/60:.1f}h"
+                        else:
+                            eta_str = f"{eta_min:.1f}m"
+                        progress_str = f" | shard ~{shards_done:.1f}/{total_shards} ({pct:.1f}%) ETA {eta_str}"
 
-        # Step profiler
-        if profiler is not None:
-            profiler.step()
+                    print(f"  Batch {batch_idx + 1}: loss={avg_loss:.4f}, "
+                        f"move_acc={move_acc:.1f}%, "
+                        f"speed={samples_per_sec:.0f} samples/s{progress_str}")
 
-        # Early stop for testing
-        if max_batches is not None and batch_idx + 1 >= max_batches:
-            if rank == 0:
-                print(f"Stopping after {max_batches} batches (--max-batches)")
-            break
+                    if use_wandb:
+                        log_dict = {
+                            'train/loss': avg_loss,
+                            'train/move_loss': total_move_loss / total_samples,
+                            'train/move_accuracy': total_correct / total_samples,
+                            'train/samples_per_sec': samples_per_sec,
+                            'train/samples': global_samples,
+                        }
+                        if total_shards and samples_per_shard:
+                            shards_done = global_samples / samples_per_shard
+                            log_dict['train/shards_done'] = shards_done
+                            log_dict['train/progress_pct'] = shards_done / total_shards * 100
+                        if total_promo_samples > 0:
+                            log_dict['train/promo_loss'] = total_promo_loss / total_promo_samples
+                            log_dict['train/promo_accuracy'] = total_promo_correct / total_promo_samples
+                        wandb.log(log_dict)
+
+            # Step profiler
+            if profiler is not None:
+                profiler.step()
+
+            # Early stop for testing
+            if max_batches is not None and batch_idx + 1 >= max_batches:
+                if rank == 0:
+                    print(f"Stopping after {max_batches} batches (--max-batches)")
+                break
 
     # Final stats - sync from GPU once at end
     total_samples = total_samples_t.item()
