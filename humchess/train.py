@@ -12,6 +12,7 @@ Usage:
 import argparse
 import glob
 import os
+import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -223,6 +224,17 @@ def train_epoch(
         promo_targets = batch['promo_id'].to(device, non_blocking=True)
         legal_mask = batch['legal_mask'].to(device, non_blocking=True)
         is_promotion = batch['is_promotion'].to(device, non_blocking=True)
+
+        # Log batch info for debugging crashes
+        # Every batch: log to stderr with CUDA sync to ensure order
+        shard_path = batch.get('shard_path', 'unknown')
+        shard_name = shard_path.split('/')[-1] if isinstance(shard_path, str) and '/' in shard_path else shard_path
+
+        # Sync CUDA before logging to ensure previous batch completed
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+
+        print(f"[BATCH] rank={rank} batch={batch_idx} shard={shard_name}", file=sys.stderr, flush=True)
 
         # Forward pass
         if precision == 'bf16':

@@ -352,14 +352,12 @@ class PGNDataset(IterableDataset):
         """Process a single parquet batch into training samples."""
         import numpy as np
 
-        # Convert tokens - check for jagged arrays (rows with different lengths)
-        tokens_list = batch.column("tokens").to_pylist()
-        token_lens = [len(t) for t in tokens_list]
-        if not all(l == SEQ_LENGTH for l in token_lens):
-            bad_idx = next(i for i, l in enumerate(token_lens) if l != SEQ_LENGTH)
-            raise ValueError(f"Corrupt parquet: row {bad_idx} has {token_lens[bad_idx]} tokens, expected {SEQ_LENGTH}")
+        # Convert tokens - numpy will fail or create object array if jagged
+        tokens_np = np.array(batch.column("tokens").to_pylist(), dtype=np.int64)
+        if tokens_np.ndim != 2 or tokens_np.shape[1] != SEQ_LENGTH:
+            raise ValueError(f"Corrupt parquet: tokens shape {tokens_np.shape}, expected (N, {SEQ_LENGTH})")
 
-        tokens = torch.from_numpy(np.array(tokens_list, dtype=np.int64))
+        tokens = torch.from_numpy(tokens_np)
         move_ids = torch.from_numpy(batch.column("move_id").to_numpy().astype(np.int64))
         promo_ids = torch.from_numpy(batch.column("promo_id").to_numpy().astype(np.int64))
         is_promos = torch.from_numpy(batch.column("is_promotion").to_numpy(zero_copy_only=False))
