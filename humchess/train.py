@@ -365,6 +365,17 @@ def train_epoch(
         if scheduler is not None:
             scheduler.step()
 
+        # One-time guard: fp32 master weights means the optimizer must never
+        # hold bf16 state. Catches accidental re-introduction of a model.to(bf16).
+        if step == 0:
+            p0 = next(iter(optimizer.state.values()), None)
+            if p0 is not None:
+                assert all(
+                    t.dtype == torch.float32
+                    for t in p0.values()
+                    if isinstance(t, torch.Tensor)
+                ), "optimizer state is not fp32; fp32 master weights broken"
+
         # Stats - accumulate on GPU (no sync!). Skip padded steps so metrics
         # reflect real data only.
         batch_size = tokens.size(0)
@@ -685,9 +696,14 @@ def main():
     model = ChessTransformer(**model_params)
     model = model.to(device)
 
-    # Cast to bf16 for fused RMSNorm kernels (avoids dtype mismatch with autocast)
-    if precision == 'bf16':
-        model = model.to(torch.bfloat16)
+    # NOTE: the model is intentionally kept in fp32 ("fp32 master weights").
+    # bf16 autocast casts activations/params to bf16 per-op for compute, but the
+    # parameters and optimizer state stay fp32. Permanently casting the model to
+    # bf16 (as before) also made AdamW's moment buffers bf16; with weight
+    # magnitudes ~0.02 the per-step update (~lr=1e-4) is roughly one bf16 ulp,
+    # so informative updates were rounded away and the optimizer carried ~0.4%
+    # relative error. The custom RMSNorm computes in fp32, so there is no
+    # autocast dtype mismatch.
 
     if rank == 0:
         print(f"Model params: {model_params}")

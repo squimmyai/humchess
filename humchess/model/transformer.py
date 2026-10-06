@@ -19,6 +19,30 @@ from ..data.tokenization import (
 )
 
 
+class RMSNorm(nn.Module):
+    """Root-mean-square normalization that always computes in fp32.
+
+    The built-in nn.RMSNorm keeps its weight in fp32 while autocast feeds it
+    bf16 activations, which disables the fused kernel and emits a dtype-mismatch
+    warning. This implementation promotes the input to fp32, normalizes, applies
+    the weight, and casts back, so it works cleanly with fp32 master weights +
+    bf16 autocast (the standard mixed-precision recipe).
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        dtype = x.dtype
+        x = x.float()
+        rms = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(rms + self.eps)
+        x = x * self.weight.float()
+        return x.to(dtype)
+
+
 class SelfAttention(nn.Module):
     """Multi-head self-attention with QK-norm."""
 
@@ -29,8 +53,8 @@ class SelfAttention(nn.Module):
         self.head_dim = d_model // n_heads
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.q_norm = nn.RMSNorm(self.head_dim)
-        self.k_norm = nn.RMSNorm(self.head_dim)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
         self.out = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -67,9 +91,9 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int):
         super().__init__()
-        self.rmsnorm1 = nn.RMSNorm(d_model)
+        self.rmsnorm1 = RMSNorm(d_model)
         self.attn = SelfAttention(d_model, n_heads)
-        self.rmsnorm2 = nn.RMSNorm(d_model)
+        self.rmsnorm2 = RMSNorm(d_model)
         self.ffn = FeedForward(d_model, d_ff)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -115,7 +139,7 @@ class ChessTransformer(nn.Module):
         self.register_buffer('board_pos_idx', torch.arange(64), persistent=False)
         self.register_buffer('history_pos_idx', torch.arange(6), persistent=False)
 
-        self.rmsnorm_final = nn.RMSNorm(d_model)
+        self.rmsnorm_final = RMSNorm(d_model)
         self.move_head = nn.Linear(d_model, NUM_MOVE_CLASSES)
         self.promo_head = nn.Linear(d_model, NUM_PROMO_CLASSES)
 
@@ -129,7 +153,7 @@ class ChessTransformer(nn.Module):
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
-            elif isinstance(module, nn.RMSNorm):
+            elif isinstance(module, RMSNorm):
                 nn.init.ones_(module.weight)
 
     def forward(self, tokens: Tensor) -> dict[str, Tensor]:
