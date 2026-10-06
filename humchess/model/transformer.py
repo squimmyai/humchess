@@ -12,6 +12,7 @@ Uses RMSNorm and QK-norm.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 from torch import Tensor
 
 from ..data.tokenization import (
@@ -258,10 +259,12 @@ class ChessTransformer(nn.Module):
         use_adaln: bool = True,
         d_cond: int = 128,
         ffn_type: str = 'silu',
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
         self.use_adaln = use_adaln
+        self.gradient_checkpointing = gradient_checkpointing
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(64, d_model)
@@ -336,10 +339,20 @@ class ChessTransformer(nn.Module):
             tl_tok = tokens[:, 67]
             c = self.cond_proj(self.elo_cond_emb(elo_tok) + self.tl_cond_emb(tl_tok))
             for block in self.blocks:
-                x = block(x, c)
+                # Gradient checkpointing recomputes each block's activations in
+                # the backward pass instead of storing them. This trades ~30%
+                # extra compute for a large memory reduction, which is what
+                # makes the intended per-GPU batch fit on 40GB A100s.
+                if self.gradient_checkpointing and self.training:
+                    x = checkpoint.checkpoint(block, x, c, use_reentrant=False)
+                else:
+                    x = block(x, c)
         else:
             for block in self.blocks:
-                x = block(x)
+                if self.gradient_checkpointing and self.training:
+                    x = checkpoint.checkpoint(block, x, use_reentrant=False)
+                else:
+                    x = block(x)
 
         x = self.rmsnorm_final(x)
         cls = x[:, 0]

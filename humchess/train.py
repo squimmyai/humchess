@@ -171,6 +171,7 @@ def save_checkpoint(
     world_size: int = 1,
     gather_shards: bool = True,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    keep_last: int | None = None,
 ) -> None:
     """Save checkpoint with model, optimizer, and completed shards.
 
@@ -178,6 +179,11 @@ def save_checkpoint(
         gather_shards: If True, gather completed_shards from all ranks (requires
             all ranks to call this function). If False, only rank 0 saves using
             its local completed_shards (safe for mid-epoch checkpoints).
+        keep_last: If set, retain only the N most recent ``checkpoint_shards_*.pt``
+            files in the checkpoint directory, deleting older ones. A full epoch
+            writes one checkpoint per ``checkpoint_every_n_shards`` shards; without
+            rotation these accumulate to far more than the disk holds (model +
+            optimizer state is ~0.4 GB each).
     """
     # Gather completed shards from all ranks (only if requested and distributed)
     if gather_shards and is_distributed and world_size > 1:
@@ -205,6 +211,19 @@ def save_checkpoint(
         torch.save(checkpoint, path)
         print(f"  Saved checkpoint: {path} ({len(all_shards)} shards completed)")
 
+        # Rotate old checkpoints so a full epoch cannot exhaust the disk.
+        if keep_last is not None and keep_last > 0:
+            existing = sorted(
+                path.parent.glob('checkpoint_shards_*.pt'),
+                key=lambda p: int(p.stem.rsplit('_', 1)[-1]),
+            )
+            for stale in existing[:-keep_last]:
+                try:
+                    stale.unlink()
+                    print(f"  Removed old checkpoint: {stale}")
+                except OSError as e:
+                    print(f"  Warning: could not remove {stale}: {e}")
+
 
 def train_epoch(
     model: nn.Module,
@@ -231,6 +250,7 @@ def train_epoch(
     val_max_batches: int = 20,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     max_grad_norm: float | None = 1.0,
+    keep_last_n_checkpoints: int | None = None,
 ) -> dict:
     """Train for one epoch."""
     model.train()
@@ -460,6 +480,7 @@ def train_epoch(
                     world_size=world_size,
                     gather_shards=True,
                     scheduler=scheduler,
+                    keep_last=keep_last_n_checkpoints,
                 )
                 last_checkpoint_shard_count = global_shard_count
 
@@ -625,6 +646,8 @@ def main():
     parser.add_argument('--lr', type=float, help='Override learning rate')
     parser.add_argument('--num-workers', type=int, help='Override num workers')
     parser.add_argument('--checkpoint-dir', type=str, help='Override checkpoint dir')
+    parser.add_argument('--keep-last-n-checkpoints', type=int, default=None,
+                        help='Retain only the N most recent shard checkpoints (disk safety)')
     parser.add_argument('--checkpoint-every-n-shards', type=int, default=None,
                         help='Save checkpoint every N shards (default: from config or 100)')
     parser.add_argument('--precision', type=str, choices=['bf16', 'fp16', 'fp32'],
@@ -650,6 +673,8 @@ def main():
                         help='Enable torch.profiler (outputs Chrome trace)')
     parser.add_argument('--profile-batches', type=int, default=20,
                         help='Number of batches to profile (default: 20)')
+    parser.add_argument('--gradient-checkpointing', action='store_true',
+                        help='Recompute block activations in backward to fit a larger batch')
     parser.add_argument('--debug-batches', action='store_true',
                         help='Log every batch with CUDA sync (slow, for debugging crashes)')
     args = parser.parse_args()
@@ -671,6 +696,7 @@ def main():
     precision = args.precision or train_cfg.get('precision', 'bf16')
     log_interval = train_cfg.get('log_interval', 100)
     checkpoint_every_n_shards = args.checkpoint_every_n_shards if args.checkpoint_every_n_shards is not None else train_cfg.get('checkpoint_every_n_shards', 100)
+    keep_last_n_checkpoints = args.keep_last_n_checkpoints if args.keep_last_n_checkpoints is not None else train_cfg.get('keep_last_n_checkpoints', 3)
     warmup_steps = int(train_cfg.get('warmup_steps', 0))
     min_lr_ratio = float(train_cfg.get('min_lr_ratio', 0.1))
     max_grad_norm = float(train_cfg.get('max_grad_norm', 1.0))
@@ -697,6 +723,9 @@ def main():
     model_params['use_adaln'] = bool(model_cfg.get('use_adaln', True))
     model_params['d_cond'] = int(model_cfg.get('d_cond', 128))
     model_params['ffn_type'] = str(model_cfg.get('ffn_type', 'silu'))
+    model_params['gradient_checkpointing'] = bool(
+        args.gradient_checkpointing or model_cfg.get('gradient_checkpointing', False)
+    )
     model = ChessTransformer(**model_params)
     model = model.to(device)
 
@@ -981,6 +1010,7 @@ def main():
             val_max_batches=train_cfg.get('val_max_batches', 20),
             scheduler=scheduler,
             max_grad_norm=max_grad_norm,
+            keep_last_n_checkpoints=keep_last_n_checkpoints,
         )
     except Exception:
         if is_distributed:
