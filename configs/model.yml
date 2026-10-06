@@ -1,6 +1,6 @@
 model:
   d_model: 384
-  n_heads: 8
+  n_heads: 6        # head_dim = 384/6 = 64 (tensor-core aligned)
   n_layers: 11
   d_ff: 1536
   d_head: 64        # square-pair move head inner dim (>=64 for full rank)

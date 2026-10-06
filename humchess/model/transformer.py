@@ -51,6 +51,16 @@ class SelfAttention(nn.Module):
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        # Flash attention and tensor-core matmuls prefer head_dim 64 or 128.
+        # Warn (don't fail) so non-aligned sizes remain usable for experiments.
+        if self.head_dim not in (64, 128):
+            import warnings
+            warnings.warn(
+                f"head_dim={self.head_dim} (d_model={d_model}, n_heads={n_heads}) "
+                f"is not 64 or 128; attention may run slower than necessary. "
+                f"Choose n_heads so d_model / n_heads is 64 or 128.",
+                stacklevel=2,
+            )
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.q_norm = RMSNorm(self.head_dim)
