@@ -152,6 +152,46 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class AdaLNBlock(nn.Module):
+    """Pre-norm transformer block with AdaLN-Zero conditioning.
+
+    Elo and time-left are global scalars that modulate the entire policy (a
+    1200 plays every position differently; low time changes every decision),
+    not content to attend to. Instead of routing them through attention as two
+    tokens, predict the per-block RMSNorm shift/scale (and residual gates) from
+    a conditioning vector c, and inject them directly:
+
+        h = norm(x) * (1 + scale(c)) + shift(c)
+        x = x + gate(c) * sublayer(h)
+
+    The modulation MLP is zero-initialized (adaLN-Zero), so at init scale=0,
+    shift=0, gate=0 and the block is the identity - the conditioning is learned
+    in rather than perturbing a fresh model, which is what makes it stable.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, d_cond: int):
+        super().__init__()
+        self.rmsnorm1 = RMSNorm(d_model)
+        self.attn = SelfAttention(d_model, n_heads)
+        self.rmsnorm2 = RMSNorm(d_model)
+        self.ffn = FeedForward(d_model, d_ff)
+
+        # shift1, scale1, gate1, shift2, scale2, gate2
+        self.mod = nn.Linear(d_cond, 6 * d_model)
+        nn.init.zeros_(self.mod.weight)
+        nn.init.zeros_(self.mod.bias)
+
+    def forward(self, x: Tensor, c: Tensor) -> Tensor:
+        shift1, scale1, gate1, shift2, scale2, gate2 = (
+            t.unsqueeze(1) for t in self.mod(c).chunk(6, dim=-1)
+        )
+        h = self.rmsnorm1(x) * (1 + scale1) + shift1
+        x = x + gate1 * self.attn(h)
+        h = self.rmsnorm2(x) * (1 + scale2) + shift2
+        x = x + gate2 * self.ffn(h)
+        return x
+
+
 class ChessTransformer(nn.Module):
     """
     Encoder-only transformer for human-like chess move prediction.
@@ -170,9 +210,12 @@ class ChessTransformer(nn.Module):
         n_layers: int = 6,
         d_ff: int = 1024,
         d_head: int = 64,
+        use_adaln: bool = True,
+        d_cond: int = 128,
     ):
         super().__init__()
         self.d_model = d_model
+        self.use_adaln = use_adaln
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(64, d_model)
@@ -181,10 +224,23 @@ class ChessTransformer(nn.Module):
         # History position embedding (6 slots: opponent, you, opponent, you, opponent, you)
         self.history_pos_emb = nn.Embedding(6, d_model)
 
-        self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, d_ff)
-            for _ in range(n_layers)
-        ])
+        # Conditioning embeddings for AdaLN. Elo and time-left are global
+        # scalars that modulate the whole policy; delivered via AdaLN rather
+        # than (only) as sequence tokens. Vocab covers the elo/tl bucket tokens.
+        if use_adaln:
+            self.elo_cond_emb = nn.Embedding(vocab_size, d_cond)
+            self.tl_cond_emb = nn.Embedding(vocab_size, d_cond)
+            self.cond_proj = nn.Linear(d_cond, d_cond)
+
+        block_cls = AdaLNBlock if use_adaln else TransformerBlock
+        if use_adaln:
+            self.blocks = nn.ModuleList([
+                AdaLNBlock(d_model, n_heads, d_ff, d_cond) for _ in range(n_layers)
+            ])
+        else:
+            self.blocks = nn.ModuleList([
+                TransformerBlock(d_model, n_heads, d_ff) for _ in range(n_layers)
+            ])
 
         # Cache position indices as buffers (avoids torch.arange each forward)
         self.register_buffer('board_pos_idx', torch.arange(64), persistent=False)
@@ -206,6 +262,12 @@ class ChessTransformer(nn.Module):
                 nn.init.normal_(module.weight, std=0.02)
             elif isinstance(module, RMSNorm):
                 nn.init.ones_(module.weight)
+        # AdaLN-Zero: the conditioning MLP must stay zero-initialized so each
+        # block starts as the identity. Re-zero after the generic init above.
+        if self.use_adaln:
+            for block in self.blocks:
+                nn.init.zeros_(block.mod.weight)
+                nn.init.zeros_(block.mod.bias)
 
     def forward(self, tokens: Tensor) -> dict[str, Tensor]:
         # Split tokens: board (0-67) and history (68-73)
@@ -223,8 +285,16 @@ class ChessTransformer(nn.Module):
         # Concatenate
         x = torch.cat([board_emb, history_emb], dim=1)  # (batch, 74, d_model)
 
-        for block in self.blocks:
-            x = block(x)
+        if self.use_adaln:
+            # elo is board token 66 (index 66), time-left is index 67.
+            elo_tok = tokens[:, 66]
+            tl_tok = tokens[:, 67]
+            c = self.cond_proj(self.elo_cond_emb(elo_tok) + self.tl_cond_emb(tl_tok))
+            for block in self.blocks:
+                x = block(x, c)
+        else:
+            for block in self.blocks:
+                x = block(x)
 
         x = self.rmsnorm_final(x)
         cls = x[:, 0]

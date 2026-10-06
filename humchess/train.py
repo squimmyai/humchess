@@ -693,6 +693,9 @@ def main():
 
     # Create model
     model_params = {key: int(model_cfg[key]) for key in ['d_model', 'n_heads', 'n_layers', 'd_ff']}
+    model_params['d_head'] = int(model_cfg.get('d_head', 64))
+    model_params['use_adaln'] = bool(model_cfg.get('use_adaln', True))
+    model_params['d_cond'] = int(model_cfg.get('d_cond', 128))
     model = ChessTransformer(**model_params)
     model = model.to(device)
 
