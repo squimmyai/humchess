@@ -25,6 +25,14 @@ training:
   batch_size: 3000
   lr: 1e-4
   epochs: 1
+  # LR schedule: linear warmup then cosine decay to min_lr_ratio * lr.
+  warmup_steps: 1000
+  min_lr_ratio: 0.1
+  # Gradient clipping (max L2 norm); set to 0 or null to disable.
+  max_grad_norm: 1.0
+  # Total optimizer steps for the cosine schedule. Leave unset to estimate from
+  # the shard count.
+  # max_steps:
   num_workers: 12
   prefetch_factor: 4  # batches to prefetch per worker
   precision: bf16  # bf16, fp16, fp32

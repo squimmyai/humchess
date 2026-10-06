@@ -170,6 +170,7 @@ def save_checkpoint(
     rank: int = 0,
     world_size: int = 1,
     gather_shards: bool = True,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> None:
     """Save checkpoint with model, optimizer, and completed shards.
 
@@ -199,6 +200,8 @@ def save_checkpoint(
         }
         if scaler is not None:
             checkpoint['scaler_state_dict'] = scaler.state_dict()
+        if scheduler is not None:
+            checkpoint['scheduler_state_dict'] = scheduler.state_dict()
         torch.save(checkpoint, path)
         print(f"  Saved checkpoint: {path} ({len(all_shards)} shards completed)")
 
@@ -226,6 +229,8 @@ def train_epoch(
     val_loader=None,
     eval_interval: int | None = None,
     val_max_batches: int = 20,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    max_grad_norm: float | None = 1.0,
 ) -> dict:
     """Train for one epoch."""
     model.train()
@@ -282,6 +287,10 @@ def train_epoch(
                 raise RuntimeError(
                     f"rank {rank} received no data batches; check world_size vs shard count"
                 )
+            # Single-process run: nothing to synchronize with, so stop here
+            # rather than doing a pointless zero-loss padded step.
+            if not (is_distributed and world_size > 1):
+                break
             batch = dummy_batch
         else:
             dummy_batch = batch
@@ -341,11 +350,20 @@ def train_epoch(
         optimizer.zero_grad()
         if scaler is not None:
             scaler.scale(loss).backward()
+            # Unscale before clipping so the norm is in real (unscaled) units.
+            if max_grad_norm is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            if max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
+
+        if scheduler is not None:
+            scheduler.step()
 
         # Stats - accumulate on GPU (no sync!). Skip padded steps so metrics
         # reflect real data only.
@@ -430,6 +448,7 @@ def train_epoch(
                     rank=rank,
                     world_size=world_size,
                     gather_shards=True,
+                    scheduler=scheduler,
                 )
                 last_checkpoint_shard_count = global_shard_count
 
@@ -641,6 +660,12 @@ def main():
     precision = args.precision or train_cfg.get('precision', 'bf16')
     log_interval = train_cfg.get('log_interval', 100)
     checkpoint_every_n_shards = args.checkpoint_every_n_shards if args.checkpoint_every_n_shards is not None else train_cfg.get('checkpoint_every_n_shards', 100)
+    warmup_steps = int(train_cfg.get('warmup_steps', 0))
+    min_lr_ratio = float(train_cfg.get('min_lr_ratio', 0.1))
+    max_grad_norm = float(train_cfg.get('max_grad_norm', 1.0))
+    # Total optimizer steps, needed for cosine decay. Estimated from the number
+    # of training shards; if unknown (PGN mode) fall back to a large constant.
+    max_steps = train_cfg.get('max_steps')
 
     # Setup distributed
     rank, world_size, local_rank, is_distributed = setup_distributed()
@@ -763,10 +788,12 @@ def main():
         # Note: idle DataLoader workers (when num_workers > shards-per-rank) are
         # harmless - they simply yield nothing - so only the rank-level check
         # above is a hard requirement.
+        # Computed on ALL ranks (not just rank 0) because the LR schedule and
+        # throughput/ETA estimates must be identical across ranks.
+        total_shards = len(parquet_paths)
+        samples_per_shard = get_samples_per_shard(parquet_paths)
         if rank == 0:
             print(f"Parquet files: {len(parquet_paths)} train shards, {len(val_shards)} val shards")
-            samples_per_shard = get_samples_per_shard(parquet_paths)
-            total_shards = len(parquet_paths)
             remaining_shards = total_shards - len(skip_shards)
             print(f"Total shards: {total_shards} (~{samples_per_shard:,} samples/shard)")
             if skip_shards:
@@ -822,6 +849,39 @@ def main():
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, fused=True)
 
+    # LR schedule: linear warmup then cosine decay to min_lr_ratio * lr.
+    # Transformers benefit from warmup (early gradients are large/unstable) and
+    # from decay (large constant LR late in training adds noise near the
+    # optimum). max_steps is estimated from shard count when not given.
+    scheduler = None
+    if warmup_steps > 0 or min_lr_ratio < 1.0:
+        if max_steps is None and parquet_patterns:
+            # Approximate number of optimizer steps this rank will run:
+            # (training shards / world_size) * (rows/shard / batch_size).
+            try:
+                est_batches_per_shard = max(1, samples_per_shard // batch_size) if samples_per_shard else 1
+                shards_per_rank = max(1, total_shards // world_size)
+                max_steps = max(1, shards_per_rank * est_batches_per_shard)
+            except Exception:
+                max_steps = 1_000_000
+        if max_steps is None:
+            max_steps = 1_000_000
+
+        import math
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return (step + 1) / max(1, warmup_steps)
+            progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+            progress = min(1.0, max(0.0, progress))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        if rank == 0:
+            print(f"LR schedule: warmup {warmup_steps} steps, cosine to "
+                  f"{min_lr_ratio:.0%} of {lr:g} over ~{max_steps} steps")
+
     # Load model/optimizer state if resuming
     if resume_checkpoint:
         model_to_load = model.module if is_distributed else model
@@ -829,6 +889,8 @@ def main():
         optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
         if scaler is not None and 'scaler_state_dict' in resume_checkpoint:
             scaler.load_state_dict(resume_checkpoint['scaler_state_dict'])
+        if scheduler is not None and 'scheduler_state_dict' in resume_checkpoint:
+            scheduler.load_state_dict(resume_checkpoint['scheduler_state_dict'])
         if rank == 0:
             print("Loaded model and optimizer state from checkpoint")
 
@@ -897,6 +959,8 @@ def main():
             val_loader=val_loader,
             eval_interval=train_cfg.get('eval_interval'),
             val_max_batches=train_cfg.get('val_max_batches', 20),
+            scheduler=scheduler,
+            max_grad_norm=max_grad_norm,
         )
     except Exception:
         if is_distributed:
@@ -929,6 +993,7 @@ def main():
         is_distributed=is_distributed,
         rank=rank,
         world_size=world_size,
+        scheduler=scheduler,
     )
 
     if profiler is not None:

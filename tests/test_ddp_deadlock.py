@@ -14,6 +14,7 @@ the mismatch surfaces as an exception rather than an indefinite hang.
 
 import datetime
 import os
+import socket
 
 import pytest
 import torch
@@ -30,7 +31,13 @@ from humchess.train import train_epoch
 
 PG_TIMEOUT = datetime.timedelta(seconds=30)
 BATCH = 4
-PORT = 29517
+
+
+def _free_port() -> int:
+    """Pick an unused local port so parametrized runs don't collide."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def _make_batch(batch_size: int = BATCH) -> dict:
@@ -51,9 +58,9 @@ def _make_batch(batch_size: int = BATCH) -> dict:
     }
 
 
-def _run(rank: int, world_size: int, batches: list[int], log_interval: int):
+def _run(rank: int, world_size: int, batches: list[int], log_interval: int, port: int):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(PORT)
+    os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=PG_TIMEOUT)
     try:
         torch.manual_seed(0)
@@ -98,7 +105,7 @@ def test_uneven_batches_do_not_deadlock(batches, log_interval):
     """Ranks with different batch counts must finish together, not hang."""
     mp.spawn(
         _run,
-        args=(2, batches, log_interval),
+        args=(2, batches, log_interval, _free_port()),
         nprocs=2,
         join=True,
     )
