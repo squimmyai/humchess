@@ -223,6 +223,9 @@ def train_epoch(
     is_distributed: bool = False,
     initial_completed_shards: set[str] | None = None,
     debug_batches: bool = False,
+    val_loader=None,
+    eval_interval: int | None = None,
+    val_max_batches: int = 20,
 ) -> dict:
     """Train for one epoch."""
     model.train()
@@ -481,6 +484,26 @@ def train_epoch(
                     log_dict['train/promo_accuracy'] = total_promo_correct / total_promo_samples
                 wandb.log(log_dict)
 
+            # Periodic validation (rank 0 only; evaluate() has no collectives,
+            # so other ranks simply wait at the next collective boundary).
+            if val_loader is not None and eval_interval and step % eval_interval == 0:
+                val_stats = evaluate(
+                    model=model,
+                    dataloader=val_loader,
+                    device=device,
+                    precision=precision,
+                    max_batches=val_max_batches,
+                )
+                if val_stats:
+                    print(f"  [val] Step {step}: loss={val_stats['val_loss']:.4f}, "
+                        f"move_acc={val_stats['val_move_accuracy']*100:.1f}%")
+                    if use_wandb:
+                        wandb.log({
+                            'val/loss': val_stats['val_loss'],
+                            'val/move_loss': val_stats['val_move_loss'],
+                            'val/move_accuracy': val_stats['val_move_accuracy'],
+                        })
+
     # Final stats - sync from GPU once at end
     total_samples = total_samples_t.item()
     total_loss = total_loss_t.item()
@@ -503,6 +526,64 @@ def train_epoch(
         stats['promo_accuracy'] = total_promo_correct / total_promo_samples
 
     return stats
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    dataloader,
+    device: torch.device,
+    precision: str = 'bf16',
+    max_batches: int | None = 20,
+) -> dict:
+    """Evaluate on held-out data.
+
+    Runs a bounded number of batches, so validation cost is fixed and small
+    relative to an epoch. Performs no collectives - callers run it on a single
+    rank - so it cannot affect the distributed step alignment of training.
+    """
+    model.eval()
+
+    total_loss = 0.0
+    total_move_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    for batch_idx, batch in enumerate(dataloader):
+        tokens = batch['tokens'].to(device, non_blocking=True)
+        move_targets = batch['move_id'].to(device, non_blocking=True)
+        legal_mask = batch['legal_mask'].to(device, non_blocking=True)
+
+        if precision == 'bf16':
+            autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        elif precision == 'fp16':
+            autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
+        else:
+            autocast_ctx = nullcontext()
+
+        with autocast_ctx:
+            outputs = model(tokens)
+            move_loss = masked_cross_entropy(outputs['move_logits'], move_targets, legal_mask)
+
+        n = tokens.size(0)
+        total_loss += move_loss.item() * n
+        total_move_loss += move_loss.item() * n
+        masked_logits = outputs['move_logits'].masked_fill(~legal_mask, float('-inf'))
+        total_correct += (masked_logits.argmax(dim=-1) == move_targets).sum().item()
+        total_samples += n
+
+        if max_batches is not None and batch_idx + 1 >= max_batches:
+            break
+
+    model.train()
+
+    if total_samples == 0:
+        return {}
+    return {
+        'val_loss': total_loss / total_samples,
+        'val_move_loss': total_move_loss / total_samples,
+        'val_move_accuracy': total_correct / total_samples,
+    }
 
 
 def main():
@@ -648,8 +729,26 @@ def main():
 
     total_shards = None
     samples_per_shard = None
+    val_loader = None
     if parquet_patterns:
         parquet_paths = expand_globs(parquet_patterns)
+
+        # Hold out a fraction of shards for validation. Without this the loop
+        # only ever reports training metrics, so every architecture/optimizer
+        # A/B would measure fit rather than generalization. The split is taken
+        # deterministically from the end of the sorted shard list and is the
+        # same on every rank (so sharding stays consistent).
+        val_fraction = float(train_cfg.get('val_fraction', 0.0))
+        val_shards = []
+        if val_fraction > 0:
+            n_val = max(1, int(len(parquet_paths) * val_fraction))
+            if n_val >= len(parquet_paths):
+                raise ValueError(
+                    f"val_fraction={val_fraction} would hold out all {len(parquet_paths)} shards"
+                )
+            val_shards = parquet_paths[-n_val:]
+            parquet_paths = parquet_paths[:-n_val]
+
         # Topology validation: every rank must receive at least one shard after
         # rank sharding, and every rank's shards must cover at least one worker.
         # Otherwise a rank produces zero batches and can never join the
@@ -657,7 +756,7 @@ def main():
         n_files = len(parquet_paths)
         if world_size > n_files:
             raise ValueError(
-                f"world_size={world_size} > number of parquet shards={n_files}; "
+                f"world_size={world_size} > number of training parquet shards={n_files}; "
                 f"some ranks would receive no data and deadlock. "
                 f"Reduce world_size or add shards."
             )
@@ -665,13 +764,28 @@ def main():
         # harmless - they simply yield nothing - so only the rank-level check
         # above is a hard requirement.
         if rank == 0:
-            print(f"Parquet files: {len(parquet_paths)} shards")
+            print(f"Parquet files: {len(parquet_paths)} train shards, {len(val_shards)} val shards")
             samples_per_shard = get_samples_per_shard(parquet_paths)
             total_shards = len(parquet_paths)
             remaining_shards = total_shards - len(skip_shards)
             print(f"Total shards: {total_shards} (~{samples_per_shard:,} samples/shard)")
             if skip_shards:
                 print(f"Remaining shards: {remaining_shards}")
+
+        if val_shards:
+            val_dataset = PGNDataset.from_parquet(
+                parquet_paths=val_shards,
+                rank=0,
+                world_size=1,
+                batch_size=batch_size,
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=1,
+                num_workers=0,
+                collate_fn=lambda x: x[0],
+            )
+
         dataset = PGNDataset.from_parquet(
             parquet_paths=parquet_paths,
             rank=rank,
@@ -780,6 +894,9 @@ def main():
             is_distributed=is_distributed,
             initial_completed_shards=skip_shards,
             debug_batches=args.debug_batches,
+            val_loader=val_loader,
+            eval_interval=train_cfg.get('eval_interval'),
+            val_max_batches=train_cfg.get('val_max_batches', 20),
         )
     except Exception:
         if is_distributed:
