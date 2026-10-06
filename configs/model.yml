@@ -1,12 +1,12 @@
 model:
   d_model: 384
   n_heads: 6        # head_dim = 384/6 = 64 (tensor-core aligned)
-  n_layers: 11
+  n_layers: 14
   d_ff: 1536
   d_head: 64        # square-pair move head inner dim (>=64 for full rank)
   use_adaln: true   # AdaLN-Zero conditioning on Elo/time
   d_cond: 128       # conditioning vector width for AdaLN
-  ffn_type: silu    # 'silu' (2-matrix) or 'swiglu' (gated, equal params)
+  ffn_type: swiglu  # 'silu' (2-matrix) or 'swiglu' (gated, equal params)
 
 data:
   # Parquet shards - supports globs and directories
