@@ -75,7 +75,7 @@ class SelfAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """Position-wise feed-forward network."""
+    """Position-wise feed-forward network (plain SiLU)."""
 
     def __init__(self, d_model: int, d_ff: int):
         super().__init__()
@@ -84,6 +84,41 @@ class FeedForward(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.w2(F.silu(self.w1(x)))
+
+
+class SwiGLU(nn.Module):
+    """Gated feed-forward: W_down(SiLU(W_gate x) * W_up x).
+
+    A gated linear unit lets one pathway multiplicatively modulate the other
+    (a data-dependent gate), which is a richer function class than a pointwise
+    nonlinearity on a single pathway. Uses d_ff_inner ~ 2/3 d_ff so that the
+    three matrices cost the same parameters/FLOPs as the two-matrix FFN:
+
+        2 * d * d_ff  ==  3 * d * d_ff_inner   =>   d_ff_inner = 2/3 * d_ff
+    """
+
+    def __init__(self, d_model: int, d_ff: int):
+        super().__init__()
+        d_ff_inner = _round_to_multiple(max(1, int(round(d_ff * 2 / 3))), 64)
+        self.d_ff_inner = d_ff_inner
+        self.w_gate = nn.Linear(d_model, d_ff_inner, bias=False)
+        self.w_up = nn.Linear(d_model, d_ff_inner, bias=False)
+        self.w_down = nn.Linear(d_ff_inner, d_model, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+
+
+def _round_to_multiple(n: int, m: int) -> int:
+    return max(m, (n + m // 2) // m * m)
+
+
+def make_ffn(ffn_type: str, d_model: int, d_ff: int) -> nn.Module:
+    if ffn_type == 'swiglu':
+        return SwiGLU(d_model, d_ff)
+    if ffn_type == 'silu':
+        return FeedForward(d_model, d_ff)
+    raise ValueError(f"Unknown ffn_type: {ffn_type!r} (expected 'swiglu' or 'silu')")
 
 
 class SquarePairMoveHead(nn.Module):
@@ -139,12 +174,12 @@ class SquarePairMoveHead(nn.Module):
 class TransformerBlock(nn.Module):
     """Pre-norm transformer block with RMSNorm."""
 
-    def __init__(self, d_model: int, n_heads: int, d_ff: int):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, ffn_type: str = 'silu'):
         super().__init__()
         self.rmsnorm1 = RMSNorm(d_model)
         self.attn = SelfAttention(d_model, n_heads)
         self.rmsnorm2 = RMSNorm(d_model)
-        self.ffn = FeedForward(d_model, d_ff)
+        self.ffn = make_ffn(ffn_type, d_model, d_ff)
 
     def forward(self, x: Tensor) -> Tensor:
         x = x + self.attn(self.rmsnorm1(x))
@@ -169,12 +204,12 @@ class AdaLNBlock(nn.Module):
     in rather than perturbing a fresh model, which is what makes it stable.
     """
 
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, d_cond: int):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, d_cond: int, ffn_type: str = 'silu'):
         super().__init__()
         self.rmsnorm1 = RMSNorm(d_model)
         self.attn = SelfAttention(d_model, n_heads)
         self.rmsnorm2 = RMSNorm(d_model)
-        self.ffn = FeedForward(d_model, d_ff)
+        self.ffn = make_ffn(ffn_type, d_model, d_ff)
 
         # shift1, scale1, gate1, shift2, scale2, gate2
         self.mod = nn.Linear(d_cond, 6 * d_model)
@@ -212,6 +247,7 @@ class ChessTransformer(nn.Module):
         d_head: int = 64,
         use_adaln: bool = True,
         d_cond: int = 128,
+        ffn_type: str = 'silu',
     ):
         super().__init__()
         self.d_model = d_model
@@ -232,14 +268,13 @@ class ChessTransformer(nn.Module):
             self.tl_cond_emb = nn.Embedding(vocab_size, d_cond)
             self.cond_proj = nn.Linear(d_cond, d_cond)
 
-        block_cls = AdaLNBlock if use_adaln else TransformerBlock
         if use_adaln:
             self.blocks = nn.ModuleList([
-                AdaLNBlock(d_model, n_heads, d_ff, d_cond) for _ in range(n_layers)
+                AdaLNBlock(d_model, n_heads, d_ff, d_cond, ffn_type) for _ in range(n_layers)
             ])
         else:
             self.blocks = nn.ModuleList([
-                TransformerBlock(d_model, n_heads, d_ff) for _ in range(n_layers)
+                TransformerBlock(d_model, n_heads, d_ff, ffn_type) for _ in range(n_layers)
             ])
 
         # Cache position indices as buffers (avoids torch.arange each forward)

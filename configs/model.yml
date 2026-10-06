@@ -6,6 +6,7 @@ model:
   d_head: 64        # square-pair move head inner dim (>=64 for full rank)
   use_adaln: true   # AdaLN-Zero conditioning on Elo/time
   d_cond: 128       # conditioning vector width for AdaLN
+  ffn_type: silu    # 'silu' (2-matrix) or 'swiglu' (gated, equal params)
 
 data:
   # Parquet shards - supports globs and directories

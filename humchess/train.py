@@ -696,6 +696,7 @@ def main():
     model_params['d_head'] = int(model_cfg.get('d_head', 64))
     model_params['use_adaln'] = bool(model_cfg.get('use_adaln', True))
     model_params['d_cond'] = int(model_cfg.get('d_cond', 128))
+    model_params['ffn_type'] = str(model_cfg.get('ffn_type', 'silu'))
     model = ChessTransformer(**model_params)
     model = model.to(device)
 
