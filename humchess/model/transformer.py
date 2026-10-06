@@ -86,6 +86,56 @@ class FeedForward(nn.Module):
         return self.w2(F.silu(self.w1(x)))
 
 
+class SquarePairMoveHead(nn.Module):
+    """Score moves as q(from_square) . k(to_square).
+
+    Instead of collapsing the whole position into [CLS] and applying a flat
+    Linear(d_model, 4096), score each move from the hidden states of the two
+    squares it touches. The 4096 logits become a 64x64 from/to score matrix,
+    flattened as from*64 + to - exactly the existing move-ID convention, so the
+    legal mask, targets, and sampling are unchanged.
+
+    Why: a 64x64 matrix has rank <= 64, so with d_head >= 64 the bilinear form
+    can represent any from/to score matrix (no bottleneck), while sharing
+    parameters across squares and giving the head a board-geometry inductive
+    bias. It is also far smaller than Linear(384, 4096).
+
+    White normalization guarantees the side to move is always White, so the
+    geometry is always from White's perspective - no color conditioning needed.
+    """
+
+    def __init__(self, d_model: int, d_head: int = 64, use_rel_bias: bool = True):
+        super().__init__()
+        self.d_head = d_head
+        self.norm = RMSNorm(d_model)
+        self.from_proj = nn.Linear(d_model, d_head, bias=False)
+        self.to_proj = nn.Linear(d_model, d_head, bias=False)
+        self.scale = d_head ** -0.5
+        # Relative-displacement bias: index by (dfile+7, drank+7), so moves with
+        # the same geometry (e.g. any knight move) share a bias. Cheap prior.
+        self.use_rel_bias = use_rel_bias
+        if use_rel_bias:
+            self.rel_bias = nn.Parameter(torch.zeros(15, 15))
+
+    def forward(self, square_hidden: Tensor) -> Tensor:
+        # square_hidden: (B, 64, d_model), squares in a1..h8 order.
+        h = self.norm(square_hidden)
+        q = self.from_proj(h)                       # (B, 64, d_head)
+        k = self.to_proj(h)                         # (B, 64, d_head)
+        scores = (q @ k.transpose(1, 2)) * self.scale  # (B, 64, 64)
+        if self.use_rel_bias:
+            scores = scores + self._rel_bias_matrix(scores.device, scores.dtype)
+        return scores.reshape(scores.shape[0], 64 * 64)
+
+    def _rel_bias_matrix(self, device, dtype) -> Tensor:
+        idx = torch.arange(64, device=device)
+        from_file, from_rank = idx % 8, idx // 8
+        to_file, to_rank = idx % 8, idx // 8
+        dfile = (to_file.view(1, 64) - from_file.view(64, 1)) + 7
+        drank = (to_rank.view(1, 64) - from_rank.view(64, 1)) + 7
+        return self.rel_bias[dfile, drank].to(dtype)
+
+
 class TransformerBlock(nn.Module):
     """Pre-norm transformer block with RMSNorm."""
 
@@ -119,6 +169,7 @@ class ChessTransformer(nn.Module):
         n_heads: int = 8,
         n_layers: int = 6,
         d_ff: int = 1024,
+        d_head: int = 64,
     ):
         super().__init__()
         self.d_model = d_model
@@ -140,7 +191,7 @@ class ChessTransformer(nn.Module):
         self.register_buffer('history_pos_idx', torch.arange(6), persistent=False)
 
         self.rmsnorm_final = RMSNorm(d_model)
-        self.move_head = nn.Linear(d_model, NUM_MOVE_CLASSES)
+        self.move_head = SquarePairMoveHead(d_model, d_head=d_head)
         self.promo_head = nn.Linear(d_model, NUM_PROMO_CLASSES)
 
         self._init_weights()
@@ -175,10 +226,12 @@ class ChessTransformer(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        cls = self.rmsnorm_final(x[:, 0])
+        x = self.rmsnorm_final(x)
+        cls = x[:, 0]
+        squares = x[:, 1:65]  # (B, 64, d_model), a1..h8
 
         return {
-            'move_logits': self.move_head(cls),
+            'move_logits': self.move_head(squares),
             'promo_logits': self.promo_head(cls),
         }
 
