@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import glob
 import os
 import sys
@@ -35,15 +36,30 @@ from .data.pgn_dataset import PGNDataset, expand_s3_glob
 from .model.transformer import ChessTransformer
 
 
-def setup_distributed():
+# Default timeout for collective operations. Without this, a rank that exits
+# early (or crashes) leaves its peers blocked forever in a collective. With it,
+# the blocked ranks raise instead, turning silent hangs into visible errors.
+DEFAULT_PG_TIMEOUT = datetime.timedelta(minutes=30)
+
+
+def setup_distributed(timeout: datetime.timedelta = DEFAULT_PG_TIMEOUT):
     """Initialize distributed training if available."""
     if 'RANK' in os.environ:
         rank = int(os.environ['RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
         local_rank = int(os.environ['LOCAL_RANK'])
 
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group('nccl', device_id=torch.device(f'cuda:{local_rank}'))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            dist.init_process_group(
+                'nccl',
+                device_id=torch.device(f'cuda:{local_rank}'),
+                timeout=timeout,
+            )
+        else:
+            # CPU fallback (e.g. CI / local multi-process tests). Uses gloo so
+            # the DDP logic can be exercised without GPUs.
+            dist.init_process_group('gloo', timeout=timeout)
 
         return rank, world_size, local_rank, True
     else:
@@ -173,8 +189,8 @@ def save_checkpoint(
     else:
         all_shards = completed_shards
 
-    # Only rank 0 saves
-    if rank == 0:
+    # Only rank 0 saves (all ranks still participate in the gather above)
+    if rank == 0 and all_shards:
         model_to_save = model.module if is_distributed else model
         checkpoint = {
             'model_state_dict': model_to_save.state_dict(),
@@ -227,70 +243,111 @@ def train_epoch(
 
     start_time = time.time()
 
-    # Use join() context for DDP to handle uneven batch counts across ranks
-    # (ranks that finish early become "shadow" participants in collectives)
-    join_ctx = model.join() if is_distributed else nullcontext()
+    # ------------------------------------------------------------------
+    # Equal-step loop.
+    #
+    # Ranks receive different shards, and shards have different row counts,
+    # so ranks would otherwise run a different number of batches. Any
+    # collective issued from inside the loop (logging all_reduce, checkpoint
+    # all_reduce, save_checkpoint's all_gather_object) would then be called a
+    # different number of times per rank and deadlock.
+    #
+    # Fix: run a fixed number of steps on every rank. A rank whose data runs
+    # out keeps stepping on the last real batch with the loss zeroed, so it
+    # still performs the full forward/backward (keeping DDP's gradient
+    # allreduce in lockstep) but contributes zero gradient. Ranks stop only
+    # when a collective check says *all* are exhausted, so the iteration count
+    # is identical across ranks by construction.
+    #
+    # model.join() is intentionally NOT used: it only shadows DDP's own
+    # gradient allreduces, not the user-level collectives in this loop.
+    # ------------------------------------------------------------------
+    data_iter = iter(dataloader)
+    dummy_batch: dict | None = None
+    exhausted = False
+    step = 0
 
-    with join_ctx:
-        for batch_idx, batch in enumerate(dataloader):
-            tokens = batch['tokens'].to(device, non_blocking=True)
-            move_targets = batch['move_id'].to(device, non_blocking=True)
-            promo_targets = batch['promo_id'].to(device, non_blocking=True)
-            legal_mask = batch['legal_mask'].to(device, non_blocking=True)
-            is_promotion = batch['is_promotion'].to(device, non_blocking=True)
-
-            # Debug logging (gated behind --debug-batches flag due to perf impact)
-            if debug_batches:
-                shard_path = batch.get('shard_path', 'unknown')
-                shard_name = shard_path.split('/')[-1] if isinstance(shard_path, str) and '/' in shard_path else shard_path
-                # Sync CUDA before logging to ensure previous batch completed
-                if device.type == 'cuda':
-                    torch.cuda.synchronize(device)
-                print(f"[BATCH] rank={rank} batch={batch_idx} shard={shard_name}", file=sys.stderr, flush=True)
-
-            # Forward pass
-            if precision == 'bf16':
-                autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16)
-            elif precision == 'fp16':
-                autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
-            else:
-                autocast_ctx = nullcontext()
-
-            with autocast_ctx:
-                outputs = model(tokens)
-                move_logits = outputs['move_logits']
-                promo_logits = outputs['promo_logits']
-
-                # Move loss (always computed)
-                move_loss = masked_cross_entropy(move_logits, move_targets, legal_mask)
-
-                # Promotion loss (only for promotion moves)
-                # Clamp targets to valid range to avoid CUDA errors, then mask out non-promos
-                safe_promo_targets = promo_targets.clamp(0, 3)
-                promo_loss_per_sample = nn.functional.cross_entropy(
-                    promo_logits,
-                    safe_promo_targets,
-                    reduction='none',
+    while True:
+        if not exhausted:
+            batch = next(data_iter, None)
+            if batch is None:
+                exhausted = True
+        if exhausted:
+            if dummy_batch is None:
+                # This rank never produced a single batch. Topology validation
+                # in main() should prevent this; fail loudly rather than hang.
+                raise RuntimeError(
+                    f"rank {rank} received no data batches; check world_size vs shard count"
                 )
-                # Mask to zero for non-promotions and average over actual promotions
-                num_promos = is_promotion.sum().clamp(min=1)
-                promo_loss = (promo_loss_per_sample * is_promotion.float()).sum() / num_promos
+            batch = dummy_batch
+        else:
+            dummy_batch = batch
 
-                # Total loss
-                loss = move_loss + promo_loss
+        tokens = batch['tokens'].to(device, non_blocking=True)
+        move_targets = batch['move_id'].to(device, non_blocking=True)
+        promo_targets = batch['promo_id'].to(device, non_blocking=True)
+        legal_mask = batch['legal_mask'].to(device, non_blocking=True)
+        is_promotion = batch['is_promotion'].to(device, non_blocking=True)
 
-            # Backward pass
-            optimizer.zero_grad()
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                optimizer.step()
+        # Debug logging (gated behind --debug-batches flag due to perf impact)
+        if debug_batches:
+            shard_path = batch.get('shard_path', 'unknown')
+            shard_name = shard_path.split('/')[-1] if isinstance(shard_path, str) and '/' in shard_path else shard_path
+            # Sync CUDA before logging to ensure previous batch completed
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            print(f"[BATCH] rank={rank} step={step} shard={shard_name}", file=sys.stderr, flush=True)
 
-            # Stats - accumulate on GPU (no sync!)
-            batch_size = tokens.size(0)
+        # Forward pass
+        if precision == 'bf16':
+            autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        elif precision == 'fp16':
+            autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
+        else:
+            autocast_ctx = nullcontext()
+
+        with autocast_ctx:
+            outputs = model(tokens)
+            move_logits = outputs['move_logits']
+            promo_logits = outputs['promo_logits']
+
+            # Move loss (always computed)
+            move_loss = masked_cross_entropy(move_logits, move_targets, legal_mask)
+
+            # Promotion loss (only for promotion moves)
+            # Clamp targets to valid range to avoid CUDA errors, then mask out non-promos
+            safe_promo_targets = promo_targets.clamp(0, 3)
+            promo_loss_per_sample = nn.functional.cross_entropy(
+                promo_logits,
+                safe_promo_targets,
+                reduction='none',
+            )
+            # Mask to zero for non-promotions and average over actual promotions
+            num_promos = is_promotion.sum().clamp(min=1)
+            promo_loss = (promo_loss_per_sample * is_promotion.float()).sum() / num_promos
+
+            # Total loss
+            loss = move_loss + promo_loss
+
+        # Zero the loss on padded steps so the padded rank contributes no
+        # gradient while still participating in DDP's gradient allreduce.
+        if exhausted:
+            loss = loss * 0.0
+
+        # Backward pass
+        optimizer.zero_grad()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        # Stats - accumulate on GPU (no sync!). Skip padded steps so metrics
+        # reflect real data only.
+        batch_size = tokens.size(0)
+        if not exhausted:
             with torch.no_grad():
                 num_promos = is_promotion.sum()
                 total_loss_t += loss.detach() * batch_size
@@ -315,97 +372,114 @@ def train_epoch(
                 if shard_path:
                     completed_shards.add(shard_path)
 
-            # Logging and checkpointing - only sync at log intervals
-            if (batch_idx + 1) % log_interval == 0:
-                # Reduce sample count across all ranks for accurate global throughput
-                global_samples_t = total_samples_t.clone()
-                if world_size > 1:
-                    dist.all_reduce(global_samples_t, op=dist.ReduceOp.SUM)
+        # Step profiler
+        if profiler is not None:
+            profiler.step()
 
-                # Checkpoint based on global shard count (all ranks sync here)
-                if checkpoint_every_n_shards is not None and checkpoint_dir is not None:
-                    # Only count NEW shards (exclude initial to avoid double-counting on resume)
-                    local_new_shards = torch.tensor(len(completed_shards) - initial_shard_count, device=device)
-                    if world_size > 1:
-                        dist.all_reduce(local_new_shards, op=dist.ReduceOp.SUM)
-                    global_shard_count = initial_shard_count + local_new_shards.item()
+        step += 1
 
-                    # All ranks see same global_shard_count, make same decision
-                    if global_shard_count >= last_checkpoint_shard_count + checkpoint_every_n_shards:
-                        checkpoint_path = checkpoint_dir / f'checkpoint_shards_{int(global_shard_count)}.pt'
-                        save_checkpoint(
-                            path=checkpoint_path,
-                            model=model,
-                            optimizer=optimizer,
-                            scaler=scaler,
-                            completed_shards=completed_shards,
-                            is_distributed=is_distributed,
-                            rank=rank,
-                            world_size=world_size,
-                            gather_shards=True,
-                        )
-                        last_checkpoint_shard_count = global_shard_count
+        # Early stop for testing. max_batches is a global step budget, so all
+        # ranks stop at the same step (equal iteration count preserved).
+        if max_batches is not None and step >= max_batches:
+            if rank == 0:
+                print(f"Stopping after {max_batches} steps (--max-batches)")
+            break
 
-                if rank == 0:
-                    # Single sync point: pull all stats from GPU
-                    global_samples = global_samples_t.item()
-                    total_samples = total_samples_t.item()
-                    total_loss = total_loss_t.item()
-                    total_move_loss = total_move_loss_t.item()
-                    total_correct = total_correct_t.item()
-                    total_promo_samples = total_promo_samples_t.item()
-                    total_promo_correct = total_promo_correct_t.item()
-                    total_promo_loss = total_promo_loss_t.item()
+        # Logging / checkpointing / termination check, every log_interval
+        # steps. Every rank reaches these boundaries because steps are
+        # equalized by the padding above, so all collectives below are matched.
+        if step % log_interval != 0:
+            continue
 
-                    elapsed = time.time() - start_time
-                    samples_per_sec = global_samples / elapsed
-                    avg_loss = total_loss / total_samples
-                    move_acc = total_correct / total_samples * 100
+        # Collective termination check: stop only when every rank is exhausted.
+        if is_distributed and world_size > 1:
+            done_t = torch.tensor(1 if exhausted else 0, device=device)
+            dist.all_reduce(done_t, op=dist.ReduceOp.MAX)
+            all_done = bool(done_t.item())
+        else:
+            all_done = exhausted
+        if all_done:
+            break
 
-                    progress_str = ""
-                    if total_shards and samples_per_shard:
-                        shards_done = global_samples / samples_per_shard
-                        pct = shards_done / total_shards * 100
-                        remaining_shards = total_shards - shards_done
-                        remaining_samples = remaining_shards * samples_per_shard
-                        eta_sec = remaining_samples / samples_per_sec if samples_per_sec > 0 else 0
-                        eta_min = eta_sec / 60
-                        if eta_min >= 60:
-                            eta_str = f"{eta_min/60:.1f}h"
-                        else:
-                            eta_str = f"{eta_min:.1f}m"
-                        progress_str = f" | shard ~{shards_done:.1f}/{total_shards} ({pct:.1f}%) ETA {eta_str}"
+        # Reduce sample count across all ranks for accurate global throughput
+        global_samples_t = total_samples_t.clone()
+        if world_size > 1:
+            dist.all_reduce(global_samples_t, op=dist.ReduceOp.SUM)
 
-                    print(f"  Batch {batch_idx + 1}: loss={avg_loss:.4f}, "
-                        f"move_acc={move_acc:.1f}%, "
-                        f"speed={samples_per_sec:.0f} samples/s{progress_str}")
+        # Checkpoint based on global shard count (all ranks sync here)
+        if checkpoint_every_n_shards is not None and checkpoint_dir is not None:
+            # Only count NEW shards (exclude initial to avoid double-counting on resume)
+            local_new_shards = torch.tensor(len(completed_shards) - initial_shard_count, device=device)
+            if world_size > 1:
+                dist.all_reduce(local_new_shards, op=dist.ReduceOp.SUM)
+            global_shard_count = initial_shard_count + local_new_shards.item()
 
-                    if use_wandb:
-                        log_dict = {
-                            'train/loss': avg_loss,
-                            'train/move_loss': total_move_loss / total_samples,
-                            'train/move_accuracy': total_correct / total_samples,
-                            'train/samples_per_sec': samples_per_sec,
-                            'train/samples': global_samples,
-                        }
-                        if total_shards and samples_per_shard:
-                            shards_done = global_samples / samples_per_shard
-                            log_dict['train/shards_done'] = shards_done
-                            log_dict['train/progress_pct'] = shards_done / total_shards * 100
-                        if total_promo_samples > 0:
-                            log_dict['train/promo_loss'] = total_promo_loss / total_promo_samples
-                            log_dict['train/promo_accuracy'] = total_promo_correct / total_promo_samples
-                        wandb.log(log_dict)
+            # All ranks see same global_shard_count, make same decision
+            if global_shard_count >= last_checkpoint_shard_count + checkpoint_every_n_shards:
+                checkpoint_path = checkpoint_dir / f'checkpoint_shards_{int(global_shard_count)}.pt'
+                save_checkpoint(
+                    path=checkpoint_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    completed_shards=completed_shards,
+                    is_distributed=is_distributed,
+                    rank=rank,
+                    world_size=world_size,
+                    gather_shards=True,
+                )
+                last_checkpoint_shard_count = global_shard_count
 
-            # Step profiler
-            if profiler is not None:
-                profiler.step()
+        if rank == 0:
+            # Single sync point: pull all stats from GPU
+            global_samples = global_samples_t.item()
+            total_samples = total_samples_t.item()
+            total_loss = total_loss_t.item()
+            total_move_loss = total_move_loss_t.item()
+            total_correct = total_correct_t.item()
+            total_promo_samples = total_promo_samples_t.item()
+            total_promo_correct = total_promo_correct_t.item()
+            total_promo_loss = total_promo_loss_t.item()
 
-            # Early stop for testing
-            if max_batches is not None and batch_idx + 1 >= max_batches:
-                if rank == 0:
-                    print(f"Stopping after {max_batches} batches (--max-batches)")
-                break
+            elapsed = time.time() - start_time
+            samples_per_sec = global_samples / elapsed
+            avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
+            move_acc = total_correct / total_samples * 100 if total_samples > 0 else 0.0
+
+            progress_str = ""
+            if total_shards and samples_per_shard:
+                shards_done = global_samples / samples_per_shard
+                pct = shards_done / total_shards * 100
+                remaining_shards = total_shards - shards_done
+                remaining_samples = remaining_shards * samples_per_shard
+                eta_sec = remaining_samples / samples_per_sec if samples_per_sec > 0 else 0
+                eta_min = eta_sec / 60
+                if eta_min >= 60:
+                    eta_str = f"{eta_min/60:.1f}h"
+                else:
+                    eta_str = f"{eta_min:.1f}m"
+                progress_str = f" | shard ~{shards_done:.1f}/{total_shards} ({pct:.1f}%) ETA {eta_str}"
+
+            print(f"  Step {step}: loss={avg_loss:.4f}, "
+                f"move_acc={move_acc:.1f}%, "
+                f"speed={samples_per_sec:.0f} samples/s{progress_str}")
+
+            if use_wandb and total_samples > 0:
+                log_dict = {
+                    'train/loss': avg_loss,
+                    'train/move_loss': total_move_loss / total_samples,
+                    'train/move_accuracy': total_correct / total_samples,
+                    'train/samples_per_sec': samples_per_sec,
+                    'train/samples': global_samples,
+                }
+                if total_shards and samples_per_shard:
+                    shards_done = global_samples / samples_per_shard
+                    log_dict['train/shards_done'] = shards_done
+                    log_dict['train/progress_pct'] = shards_done / total_shards * 100
+                if total_promo_samples > 0:
+                    log_dict['train/promo_loss'] = total_promo_loss / total_promo_samples
+                    log_dict['train/promo_accuracy'] = total_promo_correct / total_promo_samples
+                wandb.log(log_dict)
 
     # Final stats - sync from GPU once at end
     total_samples = total_samples_t.item()
@@ -416,10 +490,11 @@ def train_epoch(
     total_promo_correct = total_promo_correct_t.item()
     total_promo_loss = total_promo_loss_t.item()
 
+    denom = max(total_samples, 1)
     stats = {
-        'loss': total_loss / total_samples,
-        'move_loss': total_move_loss / total_samples,
-        'move_accuracy': total_correct / total_samples,
+        'loss': total_loss / denom,
+        'move_loss': total_move_loss / denom,
+        'move_accuracy': total_correct / denom,
         'completed_shards': completed_shards,
     }
 
@@ -575,6 +650,20 @@ def main():
     samples_per_shard = None
     if parquet_patterns:
         parquet_paths = expand_globs(parquet_patterns)
+        # Topology validation: every rank must receive at least one shard after
+        # rank sharding, and every rank's shards must cover at least one worker.
+        # Otherwise a rank produces zero batches and can never join the
+        # collectives, which previously manifested as a hang.
+        n_files = len(parquet_paths)
+        if world_size > n_files:
+            raise ValueError(
+                f"world_size={world_size} > number of parquet shards={n_files}; "
+                f"some ranks would receive no data and deadlock. "
+                f"Reduce world_size or add shards."
+            )
+        # Note: idle DataLoader workers (when num_workers > shards-per-rank) are
+        # harmless - they simply yield nothing - so only the rank-level check
+        # above is a hard requirement.
         if rank == 0:
             print(f"Parquet files: {len(parquet_paths)} shards")
             samples_per_shard = get_samples_per_shard(parquet_paths)
@@ -668,27 +757,37 @@ def main():
     if rank == 0:
         print(f"\nStarting training (checkpoint every {checkpoint_every_n_shards} shards)")
 
-    stats = train_epoch(
-        model=model,
-        dataloader=dataloader,
-        optimizer=optimizer,
-        device=device,
-        precision=precision,
-        scaler=scaler,
-        rank=rank,
-        world_size=world_size,
-        log_interval=log_interval,
-        total_shards=total_shards,
-        samples_per_shard=samples_per_shard,
-        use_wandb=use_wandb,
-        max_batches=args.max_batches,
-        profiler=profiler,
-        checkpoint_dir=checkpoint_dir,
-        checkpoint_every_n_shards=checkpoint_every_n_shards,
-        is_distributed=is_distributed,
-        initial_completed_shards=skip_shards,
-        debug_batches=args.debug_batches,
-    )
+    # If any rank raises (corrupt data, OOM, NCCL error), tear down the process
+    # group so peers fail fast instead of blocking forever in a collective.
+    try:
+        stats = train_epoch(
+            model=model,
+            dataloader=dataloader,
+            optimizer=optimizer,
+            device=device,
+            precision=precision,
+            scaler=scaler,
+            rank=rank,
+            world_size=world_size,
+            log_interval=log_interval,
+            total_shards=total_shards,
+            samples_per_shard=samples_per_shard,
+            use_wandb=use_wandb,
+            max_batches=args.max_batches,
+            profiler=profiler,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_every_n_shards=checkpoint_every_n_shards,
+            is_distributed=is_distributed,
+            initial_completed_shards=skip_shards,
+            debug_batches=args.debug_batches,
+        )
+    except Exception:
+        if is_distributed:
+            try:
+                dist.abort()
+            except Exception:
+                pass
+        raise
 
     if rank == 0:
         print(f"\nTraining pass complete:")
@@ -698,25 +797,22 @@ def main():
             print(f"  Promo accuracy: {stats['promo_accuracy']*100:.1f}%")
         print(f"  Shards completed: {len(stats['completed_shards'])}")
 
-    # Barrier to ensure all ranks finish training before checkpointing
-    # (needed because shards may have different row counts)
-    if is_distributed:
-        dist.barrier()
-
-    # Save final checkpoint (all ranks must call due to all_gather_object inside)
-    completed_shards = stats['completed_shards']
-    if completed_shards:
-        final_checkpoint_path = checkpoint_dir / 'checkpoint_final.pt'
-        save_checkpoint(
-            path=final_checkpoint_path,
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            completed_shards=completed_shards,
-            is_distributed=is_distributed,
-            rank=rank,
-            world_size=world_size,
-        )
+    # Save final checkpoint. ALL ranks must call this unconditionally because
+    # save_checkpoint performs an all_gather_object across ranks; only rank 0
+    # actually writes, and it skips writing if no shards completed. Guarding
+    # the call itself with `if completed_shards` (as before) would hang any
+    # rank whose set happened to be empty.
+    final_checkpoint_path = checkpoint_dir / 'checkpoint_final.pt'
+    save_checkpoint(
+        path=final_checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        completed_shards=stats['completed_shards'],
+        is_distributed=is_distributed,
+        rank=rank,
+        world_size=world_size,
+    )
 
     if profiler is not None:
         profiler.stop()
