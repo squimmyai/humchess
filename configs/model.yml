@@ -31,9 +31,13 @@ training:
   # them (~0.4 GB each); without rotation they overflow the instance disk.
   keep_last_n_checkpoints: 3
   # Effective per-GPU batch. Split into grad_accum_steps micro-batches so each
-  # forward fits without gradient checkpointing (which costs ~33% compute).
+  # forward fits without gradient checkpointing. Larger micro-batches use the
+  # GPU better: measured global throughput at effective batch 12000 was
+  # 14.3k/s (micro 750), 17.0k/s (micro 1000), 20.6k/s (micro 1500). The
+  # accumulation count itself doesn't affect speed (allreduce isn't the
+  # bottleneck), so we split as little as memory allows.
   batch_size: 3000
-  grad_accum_steps: 3
+  grad_accum_steps: 2
   lr: 1e-4
   epochs: 1
   # LR schedule: linear warmup then cosine decay to min_lr_ratio * lr.

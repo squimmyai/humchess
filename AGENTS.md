@@ -144,10 +144,20 @@ micro-batch 1000, which fits, with `gradient_checkpointing: false`. The optimize
 sees the same effective batch and the same LR schedule either way. Measured
 per-GPU throughput (batch 3000, `--compile`):
 
-| design | samples/s |
-|---|---|
-| checkpointing, batch 3000, `--compile-mode reduce-overhead` | ~6,050 |
-| **accumulation, micro-batch 1000, `--compile-mode default` (chosen)** | **~7,560 (1.25x)** |
+Throughput depends mainly on the **micro-batch size** (GPU efficiency), not on
+the accumulation count. Measured global throughput on 4x A100-PCIE at effective
+batch 12000, `--compile-mode default`:
+
+| micro-batch | accum | global samples/s | peak/GPU |
+|---|---|---|---|
+| 750 | 4 | 14,300 | 14.0 GB |
+| 1000 | 3 | 17,000 | 18.5 GB |
+| **1500** | **2 (chosen)** | **20,600** | **27.4 GB** |
+
+The accumulation count barely matters (accum 3/6/12 at micro 1000 all ~17k), so
+the DDP allreduce is not the bottleneck — split as little as memory allows.
+Micro-batch 2000 reaches ~23k/s but leaves only ~3 GB headroom and changes the
+effective batch; 1500/2 is the safe pick that preserves the recipe.
 
 `--compile-mode reduce-overhead` / `max-autotune` use CUDA graphs that reuse
 output buffers; with accumulation (several forwards per step whose outputs are
@@ -173,9 +183,11 @@ has tens of GB.
 
 ## 8. Expected performance (4x A100-40GB, 30.66M model)
 
-- **~1.8 steps/s → ~21,500 samples/s** at global batch 12,000; every GPU at 100%
-  (no-checkpointing micro-batches; with gradient checkpointing it was ~17,000).
-- **~87 h (~3.6 days) per epoch** over the 10,211 shards (~6.8B positions).
+- **~20,600 samples/s** at global batch 12,000 (micro 1500 x accum 2); every GPU
+  at 100%. (An earlier SXM box measured ~17,000 with the checkpointing design.)
+- **~91 h (~3.8 days) per epoch** over the 10,211 shards (~6.8B positions).
+- Throughput is bounded by GPU efficiency on small GEMMs, not by data loading,
+  allreduce, or checkpointing. Bigger micro-batches are the lever (see §6).
 - Effective MFU is only ~17% — the model is small (384-wide), so matmuls don't
   saturate an A100. This is expected; a bigger model would get better MFU.
 - **`torch.compile` is the single biggest lever:** ~2,800 → ~7,600 samples/s
