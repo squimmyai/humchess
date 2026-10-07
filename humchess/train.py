@@ -251,6 +251,7 @@ def train_epoch(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     max_grad_norm: float | None = 1.0,
     keep_last_n_checkpoints: int | None = None,
+    grad_accum_steps: int = 1,
 ) -> dict:
     """Train for one epoch."""
     model.train()
@@ -295,95 +296,187 @@ def train_epoch(
     exhausted = False
     step = 0
 
+    # Autocast context is fixed for the run, so build it once.
+    if precision == 'bf16':
+        autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    elif precision == 'fp16':
+        autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
+    else:
+        autocast_ctx = nullcontext()
+
     while True:
-        if not exhausted:
-            batch = next(data_iter, None)
-            if batch is None:
-                exhausted = True
-        if exhausted:
-            if dummy_batch is None:
-                # This rank never produced a single batch. Topology validation
-                # in main() should prevent this; fail loudly rather than hang.
-                raise RuntimeError(
-                    f"rank {rank} received no data batches; check world_size vs shard count"
-                )
-            # Single-process run: nothing to synchronize with, so stop here
-            # rather than doing a pointless zero-loss padded step.
-            if not (is_distributed and world_size > 1):
-                break
-            batch = dummy_batch
-        else:
-            dummy_batch = batch
-
-        tokens = batch['tokens'].to(device, non_blocking=True)
-        move_targets = batch['move_id'].to(device, non_blocking=True)
-        promo_targets = batch['promo_id'].to(device, non_blocking=True)
-        legal_mask = batch['legal_mask'].to(device, non_blocking=True)
-        is_promotion = batch['is_promotion'].to(device, non_blocking=True)
-
-        # Debug logging (gated behind --debug-batches flag due to perf impact)
-        if debug_batches:
-            shard_path = batch.get('shard_path', 'unknown')
-            shard_name = shard_path.split('/')[-1] if isinstance(shard_path, str) and '/' in shard_path else shard_path
-            # Sync CUDA before logging to ensure previous batch completed
-            if device.type == 'cuda':
-                torch.cuda.synchronize(device)
-            print(f"[BATCH] rank={rank} step={step} shard={shard_name}", file=sys.stderr, flush=True)
-
-        # Forward pass
-        if precision == 'bf16':
-            autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16)
-        elif precision == 'fp16':
-            autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
-        else:
-            autocast_ctx = nullcontext()
-
-        with autocast_ctx:
-            outputs = model(tokens)
-            move_logits = outputs['move_logits']
-            promo_logits = outputs['promo_logits']
-
-            # Move loss (always computed)
-            move_loss = masked_cross_entropy(move_logits, move_targets, legal_mask)
-
-            # Promotion loss (only for promotion moves)
-            # Clamp targets to valid range to avoid CUDA errors, then mask out non-promos
-            safe_promo_targets = promo_targets.clamp(0, 3)
-            promo_loss_per_sample = nn.functional.cross_entropy(
-                promo_logits,
-                safe_promo_targets,
-                reduction='none',
-            )
-            # Mask to zero for non-promotions and average over actual promotions
-            num_promos = is_promotion.sum().clamp(min=1)
-            promo_loss = (promo_loss_per_sample * is_promotion.float()).sum() / num_promos
-
-            # Total loss
-            loss = move_loss + promo_loss
-
-        # Zero the loss on padded steps so the padded rank contributes no
-        # gradient while still participating in DDP's gradient allreduce.
-        if exhausted:
-            loss = loss * 0.0
-
-        # Backward pass
+        # ------------------------------------------------------------------
+        # One optimizer step = grad_accum_steps micro-batches.
+        #
+        # The effective per-GPU batch is micro_batch * grad_accum_steps; each
+        # micro-batch is forwarded and backwarded in turn, with gradients
+        # summed into .grad, and the optimizer steps once at the end. The
+        # equal-step invariant (every rank runs the same number of optimizer
+        # steps and issues the same collectives) is preserved: a rank that runs
+        # out of data pads *micro-batches* with its last real batch and a zeroed
+        # loss, so the boundary count is identical on every rank.
+        # ------------------------------------------------------------------
         optimizer.zero_grad()
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            # Unscale before clipping so the norm is in real (unscaled) units.
-            if max_grad_norm is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            if max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
+        # Stats accumulated on-device (set to None here, summed then consumed)
+        # so no GPU->CPU sync happens inside the micro-batch loop.
+        step_loss_t = None
+        step_move_loss_t = None
+        step_promo_loss_t = None
+        step_samples = 0
+        step_promos_t = None
+        step_correct_t = None
+        step_promo_correct_t = None
+        boundary_shard_complete = False
+        boundary_shard_path = None
 
-        if scheduler is not None:
-            scheduler.step()
+        for micro_idx in range(grad_accum_steps):
+            if not exhausted:
+                batch = next(data_iter, None)
+                if batch is None:
+                    exhausted = True
+            if exhausted:
+                if dummy_batch is None:
+                    # This rank never produced a single batch. Topology
+                    # validation in main() should prevent this; fail loudly
+                    # rather than hang.
+                    raise RuntimeError(
+                        f"rank {rank} received no data batches; check world_size vs shard count"
+                    )
+                # Single-process run: nothing to synchronize with, so stop here
+                # rather than doing pointless zero-loss padded micro-batches.
+                if not (is_distributed and world_size > 1):
+                    break
+                batch = dummy_batch
+            else:
+                dummy_batch = batch
+
+            tokens = batch['tokens'].to(device, non_blocking=True)
+            move_targets = batch['move_id'].to(device, non_blocking=True)
+            promo_targets = batch['promo_id'].to(device, non_blocking=True)
+            legal_mask = batch['legal_mask'].to(device, non_blocking=True)
+            is_promotion = batch['is_promotion'].to(device, non_blocking=True)
+
+            # Debug logging (gated behind --debug-batches flag due to perf cost)
+            if debug_batches:
+                shard_path = batch.get('shard_path', 'unknown')
+                shard_name = shard_path.split('/')[-1] if isinstance(shard_path, str) and '/' in shard_path else shard_path
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                print(f"[BATCH] rank={rank} step={step} micro={micro_idx} shard={shard_name}",
+                      file=sys.stderr, flush=True)
+
+            with autocast_ctx:
+                outputs = model(tokens)
+                move_logits = outputs['move_logits']
+                promo_logits = outputs['promo_logits']
+
+                # Move loss (always computed)
+                move_loss = masked_cross_entropy(move_logits, move_targets, legal_mask)
+
+                # Promotion loss (only for promotion moves)
+                safe_promo_targets = promo_targets.clamp(0, 3)
+                promo_loss_per_sample = nn.functional.cross_entropy(
+                    promo_logits,
+                    safe_promo_targets,
+                    reduction='none',
+                )
+                num_promos = is_promotion.sum().clamp(min=1)
+                promo_loss = (promo_loss_per_sample * is_promotion.float()).sum() / num_promos
+
+                loss = move_loss + promo_loss
+
+            # Zero the loss on padded micro-batches so an exhausted rank
+            # contributes no gradient while still participating in DDP's
+            # gradient allreduce.
+            if exhausted:
+                loss = loss * 0.0
+
+            # Divide by grad_accum_steps so the summed gradient equals the mean
+            # over the full effective batch (what a single large batch would
+            # give), keeping gradient clipping and the optimizer math identical.
+            loss = loss / grad_accum_steps
+
+            # DDP allreduce only on the final micro-batch; earlier ones
+            # accumulate local gradients via no_sync().
+            sync_now = (micro_idx == grad_accum_steps - 1) or not (is_distributed and world_size > 1)
+            if scaler is not None:
+                with (model.no_sync() if not sync_now else nullcontext()):
+                    scaler.scale(loss).backward()
+            else:
+                with (model.no_sync() if not sync_now else nullcontext()):
+                    loss.backward()
+
+            # Accumulate stats on-device for the whole effective batch. `loss`
+            # is already divided by grad_accum_steps, so multiply back to recover
+            # the per-micro-batch mean for a correct average.
+            if not exhausted:
+                with torch.no_grad():
+                    b = tokens.size(0)
+                    step_samples += b
+                    np_t = is_promotion.sum()
+                    masked_logits = move_logits.masked_fill(~legal_mask, float('-inf'))
+                    promo_preds = promo_logits.argmax(dim=-1)
+                    contribs = (
+                        (loss.detach() * grad_accum_steps + 0.0) * b,
+                        move_loss.detach() * b,
+                        promo_loss.detach() * np_t,
+                        np_t,
+                        (masked_logits.argmax(dim=-1) == move_targets).sum(),
+                        ((promo_preds == promo_targets) & is_promotion).sum(),
+                    )
+                    if step_loss_t is None:
+                        (
+                            step_loss_t, step_move_loss_t, step_promo_loss_t,
+                            step_promos_t, step_correct_t, step_promo_correct_t,
+                        ) = contribs
+                    else:
+                        (
+                            step_loss_t, step_move_loss_t, step_promo_loss_t,
+                            step_promos_t, step_correct_t, step_promo_correct_t,
+                        ) = [a + c for a, c in zip(
+                            (step_loss_t, step_move_loss_t, step_promo_loss_t,
+                             step_promos_t, step_correct_t, step_promo_correct_t),
+                            contribs,
+                        )]
+                # Track shard completion across the boundary.
+                if batch.get('shard_complete', False):
+                    boundary_shard_complete = True
+                    boundary_shard_path = batch.get('shard_path')
+
+        else:
+            # for-loop completed all micro-batches (not broken by single-process
+            # exhaustion): do the optimizer step.
+            if scaler is not None:
+                if max_grad_norm is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
+
+            if scheduler is not None:
+                scheduler.step()
+
+            # Fold the accumulated boundary stats into the GPU stat tensors
+            # (stays on-device; the big sync happens at the logging boundary).
+            if step_samples > 0:
+                total_loss_t += step_loss_t
+                total_move_loss_t += step_move_loss_t
+                total_promo_loss_t += step_promo_loss_t
+                total_samples_t += step_samples
+                total_correct_t += step_correct_t
+                total_promo_samples_t += step_promos_t
+                total_promo_correct_t += step_promo_correct_t
+
+            if boundary_shard_complete and boundary_shard_path:
+                completed_shards.add(boundary_shard_path)
+
+        # Single-process exhaustion broke out of the micro loop; stop the epoch.
+        if exhausted and not (is_distributed and world_size > 1):
+            break
 
         # One-time guard: fp32 master weights means the optimizer must never
         # hold bf16 state. Catches accidental re-introduction of a model.to(bf16).
@@ -395,34 +488,6 @@ def train_epoch(
                     for t in p0.values()
                     if isinstance(t, torch.Tensor)
                 ), "optimizer state is not fp32; fp32 master weights broken"
-
-        # Stats - accumulate on GPU (no sync!). Skip padded steps so metrics
-        # reflect real data only.
-        batch_size = tokens.size(0)
-        if not exhausted:
-            with torch.no_grad():
-                num_promos = is_promotion.sum()
-                total_loss_t += loss.detach() * batch_size
-                total_move_loss_t += move_loss.detach() * batch_size
-                total_samples_t += batch_size
-
-                # Move accuracy (with masking)
-                masked_logits = move_logits.masked_fill(~legal_mask, float('-inf'))
-                preds = masked_logits.argmax(dim=-1)
-                total_correct_t += (preds == move_targets).sum()
-
-                # Promotion accuracy - accumulate without sync
-                promo_preds = promo_logits.argmax(dim=-1)
-                total_promo_correct_t += ((promo_preds == promo_targets) & is_promotion).sum()
-                total_promo_samples_t += num_promos
-                total_promo_loss_t += promo_loss.detach() * num_promos
-
-            # Track completed shards for checkpointing
-            shard_complete = batch.get('shard_complete', False)
-            if shard_complete:
-                shard_path = batch.get('shard_path')
-                if shard_path:
-                    completed_shards.add(shard_path)
 
         # Step profiler
         if profiler is not None:
@@ -656,7 +721,7 @@ def main():
                         help='Enable TF32 matmul on CUDA')
     parser.add_argument('--compile', action='store_true',
                         help='Use torch.compile() for faster training')
-    parser.add_argument('--compile-mode', type=str, default='reduce-overhead',
+    parser.add_argument('--compile-mode', type=str, default='default',
                         choices=['default', 'reduce-overhead', 'max-autotune'],
                         help='torch.compile mode')
     parser.add_argument('--wandb', action='store_true',
@@ -675,6 +740,9 @@ def main():
                         help='Number of batches to profile (default: 20)')
     parser.add_argument('--gradient-checkpointing', action='store_true',
                         help='Recompute block activations in backward to fit a larger batch')
+    parser.add_argument('--grad-accum-steps', type=int, default=None,
+                        help='Split the per-GPU batch into this many micro-batches '
+                             '(effective batch size unchanged; lower peak memory)')
     parser.add_argument('--debug-batches', action='store_true',
                         help='Log every batch with CUDA sync (slow, for debugging crashes)')
     args = parser.parse_args()
@@ -697,6 +765,19 @@ def main():
     log_interval = train_cfg.get('log_interval', 100)
     checkpoint_every_n_shards = args.checkpoint_every_n_shards if args.checkpoint_every_n_shards is not None else train_cfg.get('checkpoint_every_n_shards', 100)
     keep_last_n_checkpoints = args.keep_last_n_checkpoints if args.keep_last_n_checkpoints is not None else train_cfg.get('keep_last_n_checkpoints', 3)
+    # Gradient accumulation: `batch_size` is the effective per-GPU batch (so the
+    # LR schedule is defined in terms of it), split into `grad_accum_steps`
+    # micro-batches that are forwarded/backwarded in sequence with gradients
+    # summed in .grad, then a single optimizer step. This decouples the memory
+    # footprint (set by the micro-batch) from the effective batch size.
+    grad_accum_steps = args.grad_accum_steps if args.grad_accum_steps is not None else int(train_cfg.get('grad_accum_steps', 1))
+    if grad_accum_steps < 1:
+        raise ValueError(f"grad_accum_steps must be >= 1, got {grad_accum_steps}")
+    if batch_size % grad_accum_steps != 0:
+        raise ValueError(
+            f"batch_size ({batch_size}) must be divisible by grad_accum_steps ({grad_accum_steps})"
+        )
+    micro_batch = batch_size // grad_accum_steps
     warmup_steps = int(train_cfg.get('warmup_steps', 0))
     min_lr_ratio = float(train_cfg.get('min_lr_ratio', 0.1))
     max_grad_norm = float(train_cfg.get('max_grad_norm', 1.0))
@@ -711,7 +792,9 @@ def main():
     if rank == 0:
         print(f"Config: {config_path}")
         print(f"Training with {world_size} GPU(s)")
-        print(f"Batch size: {batch_size} (per GPU)")
+        print(f"Batch size: {batch_size} (per GPU, effective)")
+        if grad_accum_steps > 1:
+            print(f"Gradient accumulation: {grad_accum_steps} micro-batches of {micro_batch}")
         print(f"Learning rate: {lr}")
         print(f"Precision: {precision}")
         print(f"TF32: {args.tf32}")
@@ -744,9 +827,22 @@ def main():
 
     # Compile model for faster training
     if args.compile:
+        compile_mode = args.compile_mode
+        # CUDA-graph modes ("reduce-overhead"/"max-autotune") reuse static output
+        # buffers across replays. With gradient accumulation we call the model
+        # several times per optimizer step and keep references to earlier
+        # outputs until the step ends, so a subsequent replay overwrites them
+        # ("accessing tensor output of CUDAGraphs that has been overwritten").
+        # "default" (Inductor, no CUDA graphs) has no such constraint and,
+        # measured here, is just as fast for this model.
+        if grad_accum_steps > 1 and compile_mode in ('reduce-overhead', 'max-autotune'):
+            if rank == 0:
+                print(f"Note: grad_accum_steps={grad_accum_steps} is incompatible with "
+                      f"torch.compile mode '{compile_mode}'; using 'default' instead.")
+            compile_mode = 'default'
         if rank == 0:
-            print(f"Compiling model with torch.compile(mode='{args.compile_mode}')...")
-        model = torch.compile(model, mode=args.compile_mode, fullgraph=True)
+            print(f"Compiling model with torch.compile(mode='{compile_mode}')...")
+        model = torch.compile(model, mode=compile_mode, fullgraph=True)
 
     # Initialize wandb
     use_wandb = args.wandb and rank == 0
@@ -849,11 +945,13 @@ def main():
                 print(f"Remaining shards: {remaining_shards}")
 
         if val_shards:
+            # Validation uses the micro-batch size so a forward pass cannot OOM
+            # when the effective batch is large but only the micro-batch fits.
             val_dataset = PGNDataset.from_parquet(
                 parquet_paths=val_shards,
                 rank=0,
                 world_size=1,
-                batch_size=batch_size,
+                batch_size=micro_batch,
             )
             val_loader = DataLoader(
                 val_dataset,
@@ -866,7 +964,7 @@ def main():
             parquet_paths=parquet_paths,
             rank=rank,
             world_size=world_size,
-            batch_size=batch_size,
+            batch_size=micro_batch,
             skip_shards=skip_shards,
         )
     elif pgn_patterns:
@@ -1011,6 +1109,7 @@ def main():
             scheduler=scheduler,
             max_grad_norm=max_grad_norm,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
+            grad_accum_steps=grad_accum_steps,
         )
     except Exception:
         if is_distributed:

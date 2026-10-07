@@ -103,7 +103,8 @@ Useful flags:
 |---|---|
 | `--compile` | `torch.compile` — **~2.7x faster** here, essentially required |
 | `--compile-mode default\|reduce-overhead\|max-autotune` | default `reduce-overhead` |
-| `--gradient-checkpointing` | fit a larger per-GPU batch (see §6); also config `model.gradient_checkpointing` |
+| `--grad-accum-steps N` | split the per-GPU batch into N micro-batches (see §6); also config `training.grad_accum_steps` |
+| `--gradient-checkpointing` | recompute block activations (alternative to accumulation; costs compute) |
 | `--num-workers` | DataLoader workers per rank |
 | `--keep-last-n-checkpoints` | rotate old checkpoints (see §7) |
 | `--wandb --wandb-project humchess` | W&B logging (rank 0) |
@@ -117,21 +118,47 @@ Notes:
 - Both the LR schedule length and validation split depend on the **shard count**,
   so keep `data.parquet` pointing at the full glob unless you know what you're doing.
 
-## 6. Fitting the model in memory
+## 6. Fitting the model in memory (gradient accumulation)
 
-The current 30.66M config (`d_model=384, n_heads=6, n_layers=14, d_ff=1536`,
-SwiGLU + AdaLN) **OOMs at the intended per-GPU batch of 3000 on a 40 GB A100**
-without gradient checkpointing. It fits comfortably with it:
+The 30.66M config (`d_model=384, n_heads=6, n_layers=14, d_ff=1536`, SwiGLU +
+AdaLN) **cannot forward a per-GPU batch of 3000 on a 40 GB A100** — activations
+peak above 39 GB. Measured (single A100, no checkpointing):
 
-| batch/GPU | checkpointing | peak VRAM |
-|---|---|---|
-| 1000 | off | 34.4 GB |
-| 3000 | **on** | **13.3 GB** |
+| batch/GPU | peak VRAM |
+|---|---|
+| 800 | 27.9 GB |
+| 1000 | 34.7 GB |
+| 1200 | 41.5 GB (OOM) |
+| 1500 | OOM |
 
-So `model.gradient_checkpointing: true` is set in `configs/model.yml`. It trades
-~30% extra compute for a large memory cut. Increasing the batch beyond 3000 did
-**not** improve throughput-per-sample for this model, so don't bother unless you
-want fewer steps.
+Two ways to fit it, and we chose the second:
+
+1. **Gradient checkpointing** (`gradient_checkpointing: true`): recompute block
+   activations in backward. Fits batch 3000 at 13 GB, but costs **~33% compute**.
+2. **Gradient accumulation** (`grad_accum_steps: N`): split the effective batch
+   into N micro-batches, summing gradients and stepping once. Peak memory is set
+   by the *micro*-batch, and there is **no recompute cost**.
+
+`configs/model.yml` uses **`batch_size: 3000, grad_accum_steps: 3`** →
+micro-batch 1000, which fits, with `gradient_checkpointing: false`. The optimizer
+sees the same effective batch and the same LR schedule either way. Measured
+per-GPU throughput (batch 3000, `--compile`):
+
+| design | samples/s |
+|---|---|
+| checkpointing, batch 3000, `--compile-mode reduce-overhead` | ~6,050 |
+| **accumulation, micro-batch 1000, `--compile-mode default` (chosen)** | **~7,560 (1.25x)** |
+
+`--compile-mode reduce-overhead` / `max-autotune` use CUDA graphs that reuse
+output buffers; with accumulation (several forwards per step whose outputs are
+all read at the step boundary) a replay overwrites an earlier output and raises
+`accessing tensor output of CUDAGraphs that has been overwritten`. The trainer
+auto-downgrades to `default` when `grad_accum_steps > 1`, and `default` is the
+default mode. Left as a note here because it isn't obvious from the error.
+
+`grad_accum_steps` must divide `batch_size`. `accum=1` reproduces the plain
+single-batch path exactly. Gradient equivalence is covered by
+`tests/test_grad_accum.py`.
 
 ## 7. Checkpoints and disk
 
@@ -146,12 +173,13 @@ has tens of GB.
 
 ## 8. Expected performance (4x A100-40GB, 30.66M model)
 
-- **~1.4 steps/s → ~17,000 samples/s** at global batch 12,000; every GPU at 100%.
-- **~110 h (~4.6 days) per epoch** over the 10,211 shards (~6.8B positions).
+- **~1.8 steps/s → ~21,500 samples/s** at global batch 12,000; every GPU at 100%
+  (no-checkpointing micro-batches; with gradient checkpointing it was ~17,000).
+- **~87 h (~3.6 days) per epoch** over the 10,211 shards (~6.8B positions).
 - Effective MFU is only ~17% — the model is small (384-wide), so matmuls don't
   saturate an A100. This is expected; a bigger model would get better MFU.
-- **`torch.compile` is the single biggest lever:** per-GPU 2,307 → 6,177
-  samples/s. Without it the epoch is ~8.6 days.
+- **`torch.compile` is the single biggest lever:** ~2,800 → ~7,600 samples/s
+  per GPU (mode `default`). Without it the epoch is ~10 days.
 - **Data loading is not the bottleneck.** Raw shard reads scale to >300k rows/s
   with 8 workers; converted batches cost ~40 ms/3000 rows. If GPUs aren't at
   100%, suspect compile/CPU before the data path.

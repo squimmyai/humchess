@@ -7,7 +7,7 @@ model:
   use_adaln: true   # AdaLN-Zero conditioning on Elo/time
   d_cond: 128       # conditioning vector width for AdaLN
   ffn_type: swiglu  # 'silu' (2-matrix) or 'swiglu' (gated, equal params)
-  gradient_checkpointing: true  # recompute activations in backward (needed for batch 3000 on 40GB)
+  gradient_checkpointing: false  # micro-batching (grad_accum_steps) fits without the ~33% recompute cost
 
 data:
   # Parquet shards - supports globs and directories
@@ -30,7 +30,10 @@ training:
   # Retain only the N most recent shard checkpoints. A full epoch writes ~100 of
   # them (~0.4 GB each); without rotation they overflow the instance disk.
   keep_last_n_checkpoints: 3
+  # Effective per-GPU batch. Split into grad_accum_steps micro-batches so each
+  # forward fits without gradient checkpointing (which costs ~33% compute).
   batch_size: 3000
+  grad_accum_steps: 3
   lr: 1e-4
   epochs: 1
   # LR schedule: linear warmup then cosine decay to min_lr_ratio * lr.
