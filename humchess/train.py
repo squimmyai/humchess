@@ -952,6 +952,7 @@ def main():
                 rank=0,
                 world_size=1,
                 batch_size=micro_batch,
+                drop_last=True,  # keep the compiled forward at a single shape
             )
             val_loader = DataLoader(
                 val_dataset,
@@ -966,6 +967,7 @@ def main():
             world_size=world_size,
             batch_size=micro_batch,
             skip_shards=skip_shards,
+            drop_last=True,  # keep the compiled forward at a single shape
         )
     elif pgn_patterns:
         pgn_paths = expand_globs(pgn_patterns)

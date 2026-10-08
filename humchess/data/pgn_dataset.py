@@ -235,6 +235,7 @@ class PGNDataset(IterableDataset):
         self._legal_mask_cache: LRUCache = LRUCache(maxsize=100_000)
         self._pgn_index_cache: dict[Path, dict[str, object]] = {}
         self._batch_size: int = 1024  # Default, overridden by from_parquet
+        self._drop_last: bool = False  # Default, overridden by from_parquet
 
     @classmethod
     def from_parquet(
@@ -244,8 +245,19 @@ class PGNDataset(IterableDataset):
         world_size: int = 1,
         batch_size: int = 1024,
         skip_shards: Optional[set[str]] = None,
+        drop_last: bool = False,
     ) -> "PGNDataset":
-        """Create a dataset that reads pre-tokenized Parquet shards."""
+        """Create a dataset that reads pre-tokenized Parquet shards.
+
+        Args:
+            drop_last: If True, never emit a trailing partial batch, so every
+                yielded batch is exactly ``batch_size``. Under ``torch.compile``
+                (``fullgraph=True``) each distinct input shape triggers a fresh
+                graph and the compile cache eventually overflows into a hard
+                failure; shard row counts differ, so their trailing batches do
+                too. Dropping them keeps the input shape static. The loss is
+                negligible (shards hold ~660k rows; we drop <0.25% of each).
+        """
         dataset = cls(
             pgn_paths=None,
             parquet_paths=parquet_paths,
@@ -254,6 +266,7 @@ class PGNDataset(IterableDataset):
             skip_shards=skip_shards,
         )
         dataset._batch_size = batch_size
+        dataset._drop_last = drop_last
         return dataset
 
     def __iter__(self) -> Iterator[dict]:
@@ -322,9 +335,15 @@ class PGNDataset(IterableDataset):
                 # Use read_table for R2 compatibility (avoids range request issues)
                 table = pq.read_table(f"{bucket}/{key}", filesystem=fs)
                 num_rows = table.num_rows
-                for i in range(0, num_rows, self._batch_size):
-                    batch = table.slice(i, min(self._batch_size, num_rows - i))
-                    is_last_batch = (i + self._batch_size >= num_rows)
+                starts = list(range(0, num_rows, self._batch_size))
+                if self._drop_last:
+                    starts = [i for i in starts if num_rows - i >= self._batch_size]
+                for pos, i in enumerate(starts):
+                    size = min(self._batch_size, num_rows - i)
+                    batch = table.slice(i, size)
+                    # Mark the shard complete on the last batch we actually emit,
+                    # not on the dropped partial (so checkpoint/resume stays correct).
+                    is_last_batch = (pos == len(starts) - 1)
                     try:
                         for result in self._process_parquet_batch(batch):
                             result['shard_path'] = path_str
@@ -335,11 +354,18 @@ class PGNDataset(IterableDataset):
             else:
                 parquet_file = pq.ParquetFile(path)
                 num_rows = parquet_file.metadata.num_rows
+                # Offset of the last batch we will emit (drop_last skips a
+                # partial trailing batch), so we can flag shard completion.
+                last_offset = (max(0, num_rows - 1) // self._batch_size) * self._batch_size
+                if self._drop_last and num_rows % self._batch_size != 0:
+                    last_offset = ((num_rows // self._batch_size) - 1) * self._batch_size
                 rows_yielded = 0
                 for batch in parquet_file.iter_batches(batch_size=self._batch_size):
                     batch_offset = rows_yielded
                     rows_yielded += batch.num_rows
-                    is_last_batch = (rows_yielded >= num_rows)
+                    if self._drop_last and batch.num_rows < self._batch_size:
+                        break
+                    is_last_batch = (batch_offset == last_offset)
                     try:
                         for result in self._process_parquet_batch(batch):
                             result['shard_path'] = path_str
