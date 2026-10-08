@@ -567,7 +567,10 @@ def train_epoch(
 
             progress_str = ""
             if total_shards and samples_per_shard:
-                shards_done = global_samples / samples_per_shard
+                # Include shards completed before a resume, so progress reflects
+                # the whole epoch rather than restarting at 0 on --resume.
+                done_samples = global_samples + initial_shard_count * samples_per_shard
+                shards_done = min(done_samples / samples_per_shard, total_shards)
                 pct = shards_done / total_shards * 100
                 remaining_shards = total_shards - shards_done
                 remaining_samples = remaining_shards * samples_per_shard
@@ -592,7 +595,9 @@ def train_epoch(
                     'train/samples': global_samples,
                 }
                 if total_shards and samples_per_shard:
-                    shards_done = global_samples / samples_per_shard
+                    # Whole-epoch basis (includes shards done before a resume).
+                    done_samples = global_samples + initial_shard_count * samples_per_shard
+                    shards_done = min(done_samples / samples_per_shard, total_shards)
                     log_dict['train/shards_done'] = shards_done
                     log_dict['train/progress_pct'] = shards_done / total_shards * 100
                 if total_promo_samples > 0:
