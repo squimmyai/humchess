@@ -565,8 +565,19 @@ def train_epoch(
             avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
             move_acc = total_correct / total_samples * 100 if total_samples > 0 else 0.0
 
+            # When a step budget is set (shortened anneal / smoke test), report
+            # progress and ETA against that budget; otherwise against the epoch.
             progress_str = ""
-            if total_shards and samples_per_shard:
+            if max_batches is not None:
+                pct = min(100.0, step / max_batches * 100)
+                remaining_steps = max(0, max_batches - step)
+                # Elapsed seconds per optimizer step (exact, no batch-size needed).
+                sec_per_step = elapsed / step if step > 0 else 0
+                eta_min = (remaining_steps * sec_per_step / 60) if sec_per_step else 0
+                eta_str = f"{eta_min/60:.1f}h" if eta_min >= 60 else f"{eta_min:.1f}m"
+                progress_str = (f" | run {step}/{max_batches} ({pct:.1f}%) "
+                                f"lr={optimizer.param_groups[0]['lr']:.3e} ETA {eta_str}")
+            elif total_shards and samples_per_shard:
                 # Include shards completed before a resume, so progress reflects
                 # the whole epoch rather than restarting at 0 on --resume.
                 done_samples = global_samples + initial_shard_count * samples_per_shard
@@ -593,7 +604,10 @@ def train_epoch(
                     'train/move_accuracy': total_correct / total_samples,
                     'train/samples_per_sec': samples_per_sec,
                     'train/samples': global_samples,
+                    'train/lr': optimizer.param_groups[0]['lr'],
                 }
+                if max_batches is not None:
+                    log_dict['train/run_progress_pct'] = min(100.0, step / max_batches * 100)
                 if total_shards and samples_per_shard:
                     # Whole-epoch basis (includes shards done before a resume).
                     done_samples = global_samples + initial_shard_count * samples_per_shard
@@ -750,6 +764,11 @@ def main():
                              '(effective batch size unchanged; lower peak memory)')
     parser.add_argument('--debug-batches', action='store_true',
                         help='Log every batch with CUDA sync (slow, for debugging crashes)')
+    parser.add_argument('--anneal-steps', type=int, default=None,
+                        help='On resume, cosine-decay from the CURRENT LR down to '
+                             'min_lr_ratio over this many steps (instead of the '
+                             'original full-length schedule), then hold. Pair with '
+                             '--max-batches to stop when the anneal completes.')
     args = parser.parse_args()
 
     # Load config
@@ -1047,6 +1066,49 @@ def main():
             scheduler.load_state_dict(resume_checkpoint['scheduler_state_dict'])
         if rank == 0:
             print("Loaded model and optimizer state from checkpoint")
+
+    # Optional shortened anneal on resume. The full cosine runs over ~561k
+    # steps; if validation loss has flattened and the remaining full-length
+    # schedule would cost tens of GPU-hours for a tiny gain, this cosine-decays
+    # from the *current* LR down to min_lr_ratio over --anneal-steps and then
+    # holds. It is continuous with the old schedule (starts at the exact LR in
+    # the checkpoint), so there is no jump. Stop it with
+    # --max-batches <anneal-steps>.
+    if args.anneal_steps is not None:
+        if not resume_checkpoint:
+            raise ValueError("--anneal-steps requires --resume (nothing to anneal from)")
+        import math as _math
+
+        anneal_start = int(
+            resume_checkpoint.get('scheduler_state_dict', {}).get('last_epoch', 0)
+        )
+        start_lr = float(resume_checkpoint['optimizer_state_dict']['param_groups'][0]['lr'])
+        start_ratio = start_lr / lr
+
+        def anneal_lambda(step: int) -> float:
+            if step <= anneal_start:
+                return start_ratio
+            p = (step - anneal_start) / max(1, args.anneal_steps)
+            p = min(1.0, max(0.0, p))
+            cos = 0.5 * (1.0 + _math.cos(_math.pi * p))
+            return min_lr_ratio + (start_ratio - min_lr_ratio) * cos
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, anneal_lambda)
+        # LambdaLR captures base_lrs from the optimizer's CURRENT lr, which the
+        # resume just set to the already-decayed value. Pin the base to the peak
+        # lr so lr_lambda (a ratio of peak) is not applied twice.
+        scheduler.base_lrs = [lr] * len(optimizer.param_groups)
+        scheduler.last_epoch = anneal_start
+        for g in optimizer.param_groups:
+            g['lr'] = start_lr
+        scheduler._last_lr = [start_lr]
+        if rank == 0:
+            print(
+                f"Anneal: cosine from {start_ratio*lr:g} ({start_ratio:.2f}x) "
+                f"down to {min_lr_ratio*lr:g} ({min_lr_ratio:.0%}x) over "
+                f"{args.anneal_steps} steps, starting at global step {anneal_start}; "
+                f"stop with --max-batches {args.anneal_steps}"
+            )
 
     # Training loop
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
