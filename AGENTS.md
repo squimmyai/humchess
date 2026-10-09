@@ -109,7 +109,8 @@ Useful flags:
 | `--keep-last-n-checkpoints` | rotate old checkpoints (see §7) |
 | `--wandb --wandb-project humchess` | W&B logging (rank 0) |
 | `--resume <ckpt.pt>` | resume model/optimizer/scheduler/progress |
-| `--max-batches N` | stop early (smoke tests) |
+| `--anneal-steps N` | on resume, cosine from the checkpoint's current LR down to `min_lr_ratio` over N steps, then hold (shortens the tail; pair with `--max-batches N`) |
+| `--max-batches N` | stop early (smoke tests / anneal end; also switches the progress line to run-based) |
 
 Notes:
 - `torchrun` sets `OMP_NUM_THREADS=1` per rank. That mostly matters for the CPU
@@ -196,6 +197,15 @@ has tens of GB.
   with 8 workers; converted batches cost ~40 ms/3000 rows. If GPUs aren't at
   100%, suspect compile/CPU before the data path.
 
+### When to stop: the model is capacity-bound, not data-bound
+
+Validation loss falls logarithmically and flattens hard (~1.72 → 1.46 → 1.40 →
+1.38 by ~180k steps). The model has 30.66M params and the epoch is ~500B tokens,
+so it is ~100x+ past the compute-optimal data point: extra data buys almost
+nothing. What remains is mostly the LR anneal, not new data — so it is cheaper
+to **shorten the schedule** (`--anneal-steps N --max-batches N`) than to run the
+full epoch. To actually use the 6.8B positions, scale the model instead.
+
 ## 9. Troubleshooting
 
 - **CUDA OOM at startup** → enable gradient checkpointing (§6), and set
@@ -211,6 +221,18 @@ has tens of GB.
   uneven shard counts don't deadlock, and validates `world_size <= n_shards`.
   If it still hangs, check that all ranks launched together and the default
   process-group timeout (30 min) is enough for your slowest startup.
+- **`FailOnRecompileLimitHit: Hard failure due to fullgraph=True` / `Dynamo hit
+  config.recompile_limit (8)`** → `torch.compile` saw too many distinct input
+  shapes. Parquet shards have different row counts, so their trailing partial
+  batches differ in size and each new size builds a fresh graph; with
+  `fullgraph=True` the 9th graph is fatal (it killed a run at step 116,400).
+  Fixed by `drop_last=True` in `PGNDataset.from_parquet` (set for both train and
+  val datasets in `train.py`), which emits only full `micro_batch`-sized batches.
+  If you ever bypass that (new dataset path), either force one shape or raise
+  `torch._dynamo.config.recompile_limit` / use `dynamic=True` — but note
+  `dynamic=True` still recompiled on `pad_mm` guards in testing, so a static
+  shape is the reliable fix. Do **not** just raise the limit and hope: recompiles
+  also leak memory. Resume with `--resume checkpoints/checkpoint_shards_<N>.pt`.
 
 ## 10. Vast.ai specifics (if that's the host)
 
