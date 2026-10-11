@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import glob
 import os
 import sys
@@ -35,15 +36,30 @@ from .data.pgn_dataset import PGNDataset, expand_s3_glob
 from .model.transformer import ChessTransformer
 
 
-def setup_distributed():
+# Default timeout for collective operations. Without this, a rank that exits
+# early (or crashes) leaves its peers blocked forever in a collective. With it,
+# the blocked ranks raise instead, turning silent hangs into visible errors.
+DEFAULT_PG_TIMEOUT = datetime.timedelta(minutes=30)
+
+
+def setup_distributed(timeout: datetime.timedelta = DEFAULT_PG_TIMEOUT):
     """Initialize distributed training if available."""
     if 'RANK' in os.environ:
         rank = int(os.environ['RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
         local_rank = int(os.environ['LOCAL_RANK'])
 
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group('nccl', device_id=torch.device(f'cuda:{local_rank}'))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            dist.init_process_group(
+                'nccl',
+                device_id=torch.device(f'cuda:{local_rank}'),
+                timeout=timeout,
+            )
+        else:
+            # CPU fallback (e.g. CI / local multi-process tests). Uses gloo so
+            # the DDP logic can be exercised without GPUs.
+            dist.init_process_group('gloo', timeout=timeout)
 
         return rank, world_size, local_rank, True
     else:
@@ -154,6 +170,8 @@ def save_checkpoint(
     rank: int = 0,
     world_size: int = 1,
     gather_shards: bool = True,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    keep_last: int | None = None,
 ) -> None:
     """Save checkpoint with model, optimizer, and completed shards.
 
@@ -161,6 +179,11 @@ def save_checkpoint(
         gather_shards: If True, gather completed_shards from all ranks (requires
             all ranks to call this function). If False, only rank 0 saves using
             its local completed_shards (safe for mid-epoch checkpoints).
+        keep_last: If set, retain only the N most recent ``checkpoint_shards_*.pt``
+            files in the checkpoint directory, deleting older ones. A full epoch
+            writes one checkpoint per ``checkpoint_every_n_shards`` shards; without
+            rotation these accumulate to far more than the disk holds (model +
+            optimizer state is ~0.4 GB each).
     """
     # Gather completed shards from all ranks (only if requested and distributed)
     if gather_shards and is_distributed and world_size > 1:
@@ -173,8 +196,8 @@ def save_checkpoint(
     else:
         all_shards = completed_shards
 
-    # Only rank 0 saves
-    if rank == 0:
+    # Only rank 0 saves (all ranks still participate in the gather above)
+    if rank == 0 and all_shards:
         model_to_save = model.module if is_distributed else model
         checkpoint = {
             'model_state_dict': model_to_save.state_dict(),
@@ -183,8 +206,23 @@ def save_checkpoint(
         }
         if scaler is not None:
             checkpoint['scaler_state_dict'] = scaler.state_dict()
+        if scheduler is not None:
+            checkpoint['scheduler_state_dict'] = scheduler.state_dict()
         torch.save(checkpoint, path)
         print(f"  Saved checkpoint: {path} ({len(all_shards)} shards completed)")
+
+        # Rotate old checkpoints so a full epoch cannot exhaust the disk.
+        if keep_last is not None and keep_last > 0:
+            existing = sorted(
+                path.parent.glob('checkpoint_shards_*.pt'),
+                key=lambda p: int(p.stem.rsplit('_', 1)[-1]),
+            )
+            for stale in existing[:-keep_last]:
+                try:
+                    stale.unlink()
+                    print(f"  Removed old checkpoint: {stale}")
+                except OSError as e:
+                    print(f"  Warning: could not remove {stale}: {e}")
 
 
 def train_epoch(
@@ -207,6 +245,13 @@ def train_epoch(
     is_distributed: bool = False,
     initial_completed_shards: set[str] | None = None,
     debug_batches: bool = False,
+    val_loader=None,
+    eval_interval: int | None = None,
+    val_max_batches: int = 20,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    max_grad_norm: float | None = 1.0,
+    keep_last_n_checkpoints: int | None = None,
+    grad_accum_steps: int = 1,
 ) -> dict:
     """Train for one epoch."""
     model.train()
@@ -227,34 +272,98 @@ def train_epoch(
 
     start_time = time.time()
 
-    # Use join() context for DDP to handle uneven batch counts across ranks
-    # (ranks that finish early become "shadow" participants in collectives)
-    join_ctx = model.join() if is_distributed else nullcontext()
+    # ------------------------------------------------------------------
+    # Equal-step loop.
+    #
+    # Ranks receive different shards, and shards have different row counts,
+    # so ranks would otherwise run a different number of batches. Any
+    # collective issued from inside the loop (logging all_reduce, checkpoint
+    # all_reduce, save_checkpoint's all_gather_object) would then be called a
+    # different number of times per rank and deadlock.
+    #
+    # Fix: run a fixed number of steps on every rank. A rank whose data runs
+    # out keeps stepping on the last real batch with the loss zeroed, so it
+    # still performs the full forward/backward (keeping DDP's gradient
+    # allreduce in lockstep) but contributes zero gradient. Ranks stop only
+    # when a collective check says *all* are exhausted, so the iteration count
+    # is identical across ranks by construction.
+    #
+    # model.join() is intentionally NOT used: it only shadows DDP's own
+    # gradient allreduces, not the user-level collectives in this loop.
+    # ------------------------------------------------------------------
+    data_iter = iter(dataloader)
+    dummy_batch: dict | None = None
+    exhausted = False
+    step = 0
 
-    with join_ctx:
-        for batch_idx, batch in enumerate(dataloader):
+    # Autocast context is fixed for the run, so build it once.
+    if precision == 'bf16':
+        autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    elif precision == 'fp16':
+        autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
+    else:
+        autocast_ctx = nullcontext()
+
+    while True:
+        # ------------------------------------------------------------------
+        # One optimizer step = grad_accum_steps micro-batches.
+        #
+        # The effective per-GPU batch is micro_batch * grad_accum_steps; each
+        # micro-batch is forwarded and backwarded in turn, with gradients
+        # summed into .grad, and the optimizer steps once at the end. The
+        # equal-step invariant (every rank runs the same number of optimizer
+        # steps and issues the same collectives) is preserved: a rank that runs
+        # out of data pads *micro-batches* with its last real batch and a zeroed
+        # loss, so the boundary count is identical on every rank.
+        # ------------------------------------------------------------------
+        optimizer.zero_grad()
+        # Stats accumulated on-device (set to None here, summed then consumed)
+        # so no GPU->CPU sync happens inside the micro-batch loop.
+        step_loss_t = None
+        step_move_loss_t = None
+        step_promo_loss_t = None
+        step_samples = 0
+        step_promos_t = None
+        step_correct_t = None
+        step_promo_correct_t = None
+        boundary_shard_complete = False
+        boundary_shard_path = None
+
+        for micro_idx in range(grad_accum_steps):
+            if not exhausted:
+                batch = next(data_iter, None)
+                if batch is None:
+                    exhausted = True
+            if exhausted:
+                if dummy_batch is None:
+                    # This rank never produced a single batch. Topology
+                    # validation in main() should prevent this; fail loudly
+                    # rather than hang.
+                    raise RuntimeError(
+                        f"rank {rank} received no data batches; check world_size vs shard count"
+                    )
+                # Single-process run: nothing to synchronize with, so stop here
+                # rather than doing pointless zero-loss padded micro-batches.
+                if not (is_distributed and world_size > 1):
+                    break
+                batch = dummy_batch
+            else:
+                dummy_batch = batch
+
             tokens = batch['tokens'].to(device, non_blocking=True)
             move_targets = batch['move_id'].to(device, non_blocking=True)
             promo_targets = batch['promo_id'].to(device, non_blocking=True)
             legal_mask = batch['legal_mask'].to(device, non_blocking=True)
             is_promotion = batch['is_promotion'].to(device, non_blocking=True)
 
-            # Debug logging (gated behind --debug-batches flag due to perf impact)
+            # Debug logging (gated behind --debug-batches flag due to perf cost)
             if debug_batches:
                 shard_path = batch.get('shard_path', 'unknown')
                 shard_name = shard_path.split('/')[-1] if isinstance(shard_path, str) and '/' in shard_path else shard_path
-                # Sync CUDA before logging to ensure previous batch completed
                 if device.type == 'cuda':
                     torch.cuda.synchronize(device)
-                print(f"[BATCH] rank={rank} batch={batch_idx} shard={shard_name}", file=sys.stderr, flush=True)
-
-            # Forward pass
-            if precision == 'bf16':
-                autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16)
-            elif precision == 'fp16':
-                autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
-            else:
-                autocast_ctx = nullcontext()
+                print(f"[BATCH] rank={rank} step={step} micro={micro_idx} shard={shard_name}",
+                      file=sys.stderr, flush=True)
 
             with autocast_ctx:
                 outputs = model(tokens)
@@ -265,147 +374,270 @@ def train_epoch(
                 move_loss = masked_cross_entropy(move_logits, move_targets, legal_mask)
 
                 # Promotion loss (only for promotion moves)
-                # Clamp targets to valid range to avoid CUDA errors, then mask out non-promos
                 safe_promo_targets = promo_targets.clamp(0, 3)
                 promo_loss_per_sample = nn.functional.cross_entropy(
                     promo_logits,
                     safe_promo_targets,
                     reduction='none',
                 )
-                # Mask to zero for non-promotions and average over actual promotions
                 num_promos = is_promotion.sum().clamp(min=1)
                 promo_loss = (promo_loss_per_sample * is_promotion.float()).sum() / num_promos
 
-                # Total loss
                 loss = move_loss + promo_loss
 
-            # Backward pass
-            optimizer.zero_grad()
+            # Zero the loss on padded micro-batches so an exhausted rank
+            # contributes no gradient while still participating in DDP's
+            # gradient allreduce.
+            if exhausted:
+                loss = loss * 0.0
+
+            # Divide by grad_accum_steps so the summed gradient equals the mean
+            # over the full effective batch (what a single large batch would
+            # give), keeping gradient clipping and the optimizer math identical.
+            loss = loss / grad_accum_steps
+
+            # DDP allreduce only on the final micro-batch; earlier ones
+            # accumulate local gradients via no_sync().
+            sync_now = (micro_idx == grad_accum_steps - 1) or not (is_distributed and world_size > 1)
             if scaler is not None:
-                scaler.scale(loss).backward()
+                with (model.no_sync() if not sync_now else nullcontext()):
+                    scaler.scale(loss).backward()
+            else:
+                with (model.no_sync() if not sync_now else nullcontext()):
+                    loss.backward()
+
+            # Accumulate stats on-device for the whole effective batch. `loss`
+            # is already divided by grad_accum_steps, so multiply back to recover
+            # the per-micro-batch mean for a correct average.
+            if not exhausted:
+                with torch.no_grad():
+                    b = tokens.size(0)
+                    step_samples += b
+                    np_t = is_promotion.sum()
+                    masked_logits = move_logits.masked_fill(~legal_mask, float('-inf'))
+                    promo_preds = promo_logits.argmax(dim=-1)
+                    contribs = (
+                        (loss.detach() * grad_accum_steps + 0.0) * b,
+                        move_loss.detach() * b,
+                        promo_loss.detach() * np_t,
+                        np_t,
+                        (masked_logits.argmax(dim=-1) == move_targets).sum(),
+                        ((promo_preds == promo_targets) & is_promotion).sum(),
+                    )
+                    if step_loss_t is None:
+                        (
+                            step_loss_t, step_move_loss_t, step_promo_loss_t,
+                            step_promos_t, step_correct_t, step_promo_correct_t,
+                        ) = contribs
+                    else:
+                        (
+                            step_loss_t, step_move_loss_t, step_promo_loss_t,
+                            step_promos_t, step_correct_t, step_promo_correct_t,
+                        ) = [a + c for a, c in zip(
+                            (step_loss_t, step_move_loss_t, step_promo_loss_t,
+                             step_promos_t, step_correct_t, step_promo_correct_t),
+                            contribs,
+                        )]
+                # Track shard completion across the boundary.
+                if batch.get('shard_complete', False):
+                    boundary_shard_complete = True
+                    boundary_shard_path = batch.get('shard_path')
+
+        else:
+            # for-loop completed all micro-batches (not broken by single-process
+            # exhaustion): do the optimizer step.
+            if scaler is not None:
+                if max_grad_norm is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss.backward()
+                if max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
 
-            # Stats - accumulate on GPU (no sync!)
-            batch_size = tokens.size(0)
-            with torch.no_grad():
-                num_promos = is_promotion.sum()
-                total_loss_t += loss.detach() * batch_size
-                total_move_loss_t += move_loss.detach() * batch_size
-                total_samples_t += batch_size
+            if scheduler is not None:
+                scheduler.step()
 
-                # Move accuracy (with masking)
-                masked_logits = move_logits.masked_fill(~legal_mask, float('-inf'))
-                preds = masked_logits.argmax(dim=-1)
-                total_correct_t += (preds == move_targets).sum()
+            # Fold the accumulated boundary stats into the GPU stat tensors
+            # (stays on-device; the big sync happens at the logging boundary).
+            if step_samples > 0:
+                total_loss_t += step_loss_t
+                total_move_loss_t += step_move_loss_t
+                total_promo_loss_t += step_promo_loss_t
+                total_samples_t += step_samples
+                total_correct_t += step_correct_t
+                total_promo_samples_t += step_promos_t
+                total_promo_correct_t += step_promo_correct_t
 
-                # Promotion accuracy - accumulate without sync
-                promo_preds = promo_logits.argmax(dim=-1)
-                total_promo_correct_t += ((promo_preds == promo_targets) & is_promotion).sum()
-                total_promo_samples_t += num_promos
-                total_promo_loss_t += promo_loss.detach() * num_promos
+            if boundary_shard_complete and boundary_shard_path:
+                completed_shards.add(boundary_shard_path)
 
-            # Track completed shards for checkpointing
-            shard_complete = batch.get('shard_complete', False)
-            if shard_complete:
-                shard_path = batch.get('shard_path')
-                if shard_path:
-                    completed_shards.add(shard_path)
+        # Single-process exhaustion broke out of the micro loop; stop the epoch.
+        if exhausted and not (is_distributed and world_size > 1):
+            break
 
-            # Logging and checkpointing - only sync at log intervals
-            if (batch_idx + 1) % log_interval == 0:
-                # Reduce sample count across all ranks for accurate global throughput
-                global_samples_t = total_samples_t.clone()
-                if world_size > 1:
-                    dist.all_reduce(global_samples_t, op=dist.ReduceOp.SUM)
+        # One-time guard: fp32 master weights means the optimizer must never
+        # hold bf16 state. Catches accidental re-introduction of a model.to(bf16).
+        if step == 0:
+            p0 = next(iter(optimizer.state.values()), None)
+            if p0 is not None:
+                assert all(
+                    t.dtype == torch.float32
+                    for t in p0.values()
+                    if isinstance(t, torch.Tensor)
+                ), "optimizer state is not fp32; fp32 master weights broken"
 
-                # Checkpoint based on global shard count (all ranks sync here)
-                if checkpoint_every_n_shards is not None and checkpoint_dir is not None:
-                    # Only count NEW shards (exclude initial to avoid double-counting on resume)
-                    local_new_shards = torch.tensor(len(completed_shards) - initial_shard_count, device=device)
-                    if world_size > 1:
-                        dist.all_reduce(local_new_shards, op=dist.ReduceOp.SUM)
-                    global_shard_count = initial_shard_count + local_new_shards.item()
+        # Step profiler
+        if profiler is not None:
+            profiler.step()
 
-                    # All ranks see same global_shard_count, make same decision
-                    if global_shard_count >= last_checkpoint_shard_count + checkpoint_every_n_shards:
-                        checkpoint_path = checkpoint_dir / f'checkpoint_shards_{int(global_shard_count)}.pt'
-                        save_checkpoint(
-                            path=checkpoint_path,
-                            model=model,
-                            optimizer=optimizer,
-                            scaler=scaler,
-                            completed_shards=completed_shards,
-                            is_distributed=is_distributed,
-                            rank=rank,
-                            world_size=world_size,
-                            gather_shards=True,
-                        )
-                        last_checkpoint_shard_count = global_shard_count
+        step += 1
 
-                if rank == 0:
-                    # Single sync point: pull all stats from GPU
-                    global_samples = global_samples_t.item()
-                    total_samples = total_samples_t.item()
-                    total_loss = total_loss_t.item()
-                    total_move_loss = total_move_loss_t.item()
-                    total_correct = total_correct_t.item()
-                    total_promo_samples = total_promo_samples_t.item()
-                    total_promo_correct = total_promo_correct_t.item()
-                    total_promo_loss = total_promo_loss_t.item()
+        # Early stop for testing. max_batches is a global step budget, so all
+        # ranks stop at the same step (equal iteration count preserved).
+        if max_batches is not None and step >= max_batches:
+            if rank == 0:
+                print(f"Stopping after {max_batches} steps (--max-batches)")
+            break
 
-                    elapsed = time.time() - start_time
-                    samples_per_sec = global_samples / elapsed
-                    avg_loss = total_loss / total_samples
-                    move_acc = total_correct / total_samples * 100
+        # Logging / checkpointing / termination check, every log_interval
+        # steps. Every rank reaches these boundaries because steps are
+        # equalized by the padding above, so all collectives below are matched.
+        if step % log_interval != 0:
+            continue
 
-                    progress_str = ""
-                    if total_shards and samples_per_shard:
-                        shards_done = global_samples / samples_per_shard
-                        pct = shards_done / total_shards * 100
-                        remaining_shards = total_shards - shards_done
-                        remaining_samples = remaining_shards * samples_per_shard
-                        eta_sec = remaining_samples / samples_per_sec if samples_per_sec > 0 else 0
-                        eta_min = eta_sec / 60
-                        if eta_min >= 60:
-                            eta_str = f"{eta_min/60:.1f}h"
-                        else:
-                            eta_str = f"{eta_min:.1f}m"
-                        progress_str = f" | shard ~{shards_done:.1f}/{total_shards} ({pct:.1f}%) ETA {eta_str}"
+        # Collective termination check: stop only when every rank is exhausted.
+        if is_distributed and world_size > 1:
+            done_t = torch.tensor(1 if exhausted else 0, device=device)
+            dist.all_reduce(done_t, op=dist.ReduceOp.MAX)
+            all_done = bool(done_t.item())
+        else:
+            all_done = exhausted
+        if all_done:
+            break
 
-                    print(f"  Batch {batch_idx + 1}: loss={avg_loss:.4f}, "
-                        f"move_acc={move_acc:.1f}%, "
-                        f"speed={samples_per_sec:.0f} samples/s{progress_str}")
+        # Reduce sample count across all ranks for accurate global throughput
+        global_samples_t = total_samples_t.clone()
+        if world_size > 1:
+            dist.all_reduce(global_samples_t, op=dist.ReduceOp.SUM)
 
+        # Checkpoint based on global shard count (all ranks sync here)
+        if checkpoint_every_n_shards is not None and checkpoint_dir is not None:
+            # Only count NEW shards (exclude initial to avoid double-counting on resume)
+            local_new_shards = torch.tensor(len(completed_shards) - initial_shard_count, device=device)
+            if world_size > 1:
+                dist.all_reduce(local_new_shards, op=dist.ReduceOp.SUM)
+            global_shard_count = initial_shard_count + local_new_shards.item()
+
+            # All ranks see same global_shard_count, make same decision
+            if global_shard_count >= last_checkpoint_shard_count + checkpoint_every_n_shards:
+                checkpoint_path = checkpoint_dir / f'checkpoint_shards_{int(global_shard_count)}.pt'
+                save_checkpoint(
+                    path=checkpoint_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    completed_shards=completed_shards,
+                    is_distributed=is_distributed,
+                    rank=rank,
+                    world_size=world_size,
+                    gather_shards=True,
+                    scheduler=scheduler,
+                    keep_last=keep_last_n_checkpoints,
+                )
+                last_checkpoint_shard_count = global_shard_count
+
+        if rank == 0:
+            # Single sync point: pull all stats from GPU
+            global_samples = global_samples_t.item()
+            total_samples = total_samples_t.item()
+            total_loss = total_loss_t.item()
+            total_move_loss = total_move_loss_t.item()
+            total_correct = total_correct_t.item()
+            total_promo_samples = total_promo_samples_t.item()
+            total_promo_correct = total_promo_correct_t.item()
+            total_promo_loss = total_promo_loss_t.item()
+
+            elapsed = time.time() - start_time
+            samples_per_sec = global_samples / elapsed
+            avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
+            move_acc = total_correct / total_samples * 100 if total_samples > 0 else 0.0
+
+            # When a step budget is set (shortened anneal / smoke test), report
+            # progress and ETA against that budget; otherwise against the epoch.
+            progress_str = ""
+            if max_batches is not None:
+                pct = min(100.0, step / max_batches * 100)
+                remaining_steps = max(0, max_batches - step)
+                # Elapsed seconds per optimizer step (exact, no batch-size needed).
+                sec_per_step = elapsed / step if step > 0 else 0
+                eta_min = (remaining_steps * sec_per_step / 60) if sec_per_step else 0
+                eta_str = f"{eta_min/60:.1f}h" if eta_min >= 60 else f"{eta_min:.1f}m"
+                progress_str = (f" | run {step}/{max_batches} ({pct:.1f}%) "
+                                f"lr={optimizer.param_groups[0]['lr']:.3e} ETA {eta_str}")
+            elif total_shards and samples_per_shard:
+                # Include shards completed before a resume, so progress reflects
+                # the whole epoch rather than restarting at 0 on --resume.
+                done_samples = global_samples + initial_shard_count * samples_per_shard
+                shards_done = min(done_samples / samples_per_shard, total_shards)
+                pct = shards_done / total_shards * 100
+                remaining_shards = total_shards - shards_done
+                remaining_samples = remaining_shards * samples_per_shard
+                eta_sec = remaining_samples / samples_per_sec if samples_per_sec > 0 else 0
+                eta_min = eta_sec / 60
+                if eta_min >= 60:
+                    eta_str = f"{eta_min/60:.1f}h"
+                else:
+                    eta_str = f"{eta_min:.1f}m"
+                progress_str = f" | shard ~{shards_done:.1f}/{total_shards} ({pct:.1f}%) ETA {eta_str}"
+
+            print(f"  Step {step}: loss={avg_loss:.4f}, "
+                f"move_acc={move_acc:.1f}%, "
+                f"speed={samples_per_sec:.0f} samples/s{progress_str}")
+
+            if use_wandb and total_samples > 0:
+                log_dict = {
+                    'train/loss': avg_loss,
+                    'train/move_loss': total_move_loss / total_samples,
+                    'train/move_accuracy': total_correct / total_samples,
+                    'train/samples_per_sec': samples_per_sec,
+                    'train/samples': global_samples,
+                    'train/lr': optimizer.param_groups[0]['lr'],
+                }
+                if max_batches is not None:
+                    log_dict['train/run_progress_pct'] = min(100.0, step / max_batches * 100)
+                if total_shards and samples_per_shard:
+                    # Whole-epoch basis (includes shards done before a resume).
+                    done_samples = global_samples + initial_shard_count * samples_per_shard
+                    shards_done = min(done_samples / samples_per_shard, total_shards)
+                    log_dict['train/shards_done'] = shards_done
+                    log_dict['train/progress_pct'] = shards_done / total_shards * 100
+                if total_promo_samples > 0:
+                    log_dict['train/promo_loss'] = total_promo_loss / total_promo_samples
+                    log_dict['train/promo_accuracy'] = total_promo_correct / total_promo_samples
+                wandb.log(log_dict)
+
+            # Periodic validation (rank 0 only; evaluate() has no collectives,
+            # so other ranks simply wait at the next collective boundary).
+            if val_loader is not None and eval_interval and step % eval_interval == 0:
+                val_stats = evaluate(
+                    model=model,
+                    dataloader=val_loader,
+                    device=device,
+                    precision=precision,
+                    max_batches=val_max_batches,
+                )
+                if val_stats:
+                    print(f"  [val] Step {step}: loss={val_stats['val_loss']:.4f}, "
+                        f"move_acc={val_stats['val_move_accuracy']*100:.1f}%")
                     if use_wandb:
-                        log_dict = {
-                            'train/loss': avg_loss,
-                            'train/move_loss': total_move_loss / total_samples,
-                            'train/move_accuracy': total_correct / total_samples,
-                            'train/samples_per_sec': samples_per_sec,
-                            'train/samples': global_samples,
-                        }
-                        if total_shards and samples_per_shard:
-                            shards_done = global_samples / samples_per_shard
-                            log_dict['train/shards_done'] = shards_done
-                            log_dict['train/progress_pct'] = shards_done / total_shards * 100
-                        if total_promo_samples > 0:
-                            log_dict['train/promo_loss'] = total_promo_loss / total_promo_samples
-                            log_dict['train/promo_accuracy'] = total_promo_correct / total_promo_samples
-                        wandb.log(log_dict)
-
-            # Step profiler
-            if profiler is not None:
-                profiler.step()
-
-            # Early stop for testing
-            if max_batches is not None and batch_idx + 1 >= max_batches:
-                if rank == 0:
-                    print(f"Stopping after {max_batches} batches (--max-batches)")
-                break
+                        wandb.log({
+                            'val/loss': val_stats['val_loss'],
+                            'val/move_loss': val_stats['val_move_loss'],
+                            'val/move_accuracy': val_stats['val_move_accuracy'],
+                        })
 
     # Final stats - sync from GPU once at end
     total_samples = total_samples_t.item()
@@ -416,10 +648,11 @@ def train_epoch(
     total_promo_correct = total_promo_correct_t.item()
     total_promo_loss = total_promo_loss_t.item()
 
+    denom = max(total_samples, 1)
     stats = {
-        'loss': total_loss / total_samples,
-        'move_loss': total_move_loss / total_samples,
-        'move_accuracy': total_correct / total_samples,
+        'loss': total_loss / denom,
+        'move_loss': total_move_loss / denom,
+        'move_accuracy': total_correct / denom,
         'completed_shards': completed_shards,
     }
 
@@ -428,6 +661,64 @@ def train_epoch(
         stats['promo_accuracy'] = total_promo_correct / total_promo_samples
 
     return stats
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    dataloader,
+    device: torch.device,
+    precision: str = 'bf16',
+    max_batches: int | None = 20,
+) -> dict:
+    """Evaluate on held-out data.
+
+    Runs a bounded number of batches, so validation cost is fixed and small
+    relative to an epoch. Performs no collectives - callers run it on a single
+    rank - so it cannot affect the distributed step alignment of training.
+    """
+    model.eval()
+
+    total_loss = 0.0
+    total_move_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    for batch_idx, batch in enumerate(dataloader):
+        tokens = batch['tokens'].to(device, non_blocking=True)
+        move_targets = batch['move_id'].to(device, non_blocking=True)
+        legal_mask = batch['legal_mask'].to(device, non_blocking=True)
+
+        if precision == 'bf16':
+            autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        elif precision == 'fp16':
+            autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
+        else:
+            autocast_ctx = nullcontext()
+
+        with autocast_ctx:
+            outputs = model(tokens)
+            move_loss = masked_cross_entropy(outputs['move_logits'], move_targets, legal_mask)
+
+        n = tokens.size(0)
+        total_loss += move_loss.item() * n
+        total_move_loss += move_loss.item() * n
+        masked_logits = outputs['move_logits'].masked_fill(~legal_mask, float('-inf'))
+        total_correct += (masked_logits.argmax(dim=-1) == move_targets).sum().item()
+        total_samples += n
+
+        if max_batches is not None and batch_idx + 1 >= max_batches:
+            break
+
+    model.train()
+
+    if total_samples == 0:
+        return {}
+    return {
+        'val_loss': total_loss / total_samples,
+        'val_move_loss': total_move_loss / total_samples,
+        'val_move_accuracy': total_correct / total_samples,
+    }
 
 
 def main():
@@ -439,6 +730,8 @@ def main():
     parser.add_argument('--lr', type=float, help='Override learning rate')
     parser.add_argument('--num-workers', type=int, help='Override num workers')
     parser.add_argument('--checkpoint-dir', type=str, help='Override checkpoint dir')
+    parser.add_argument('--keep-last-n-checkpoints', type=int, default=None,
+                        help='Retain only the N most recent shard checkpoints (disk safety)')
     parser.add_argument('--checkpoint-every-n-shards', type=int, default=None,
                         help='Save checkpoint every N shards (default: from config or 100)')
     parser.add_argument('--precision', type=str, choices=['bf16', 'fp16', 'fp32'],
@@ -447,7 +740,7 @@ def main():
                         help='Enable TF32 matmul on CUDA')
     parser.add_argument('--compile', action='store_true',
                         help='Use torch.compile() for faster training')
-    parser.add_argument('--compile-mode', type=str, default='reduce-overhead',
+    parser.add_argument('--compile-mode', type=str, default='default',
                         choices=['default', 'reduce-overhead', 'max-autotune'],
                         help='torch.compile mode')
     parser.add_argument('--wandb', action='store_true',
@@ -464,8 +757,18 @@ def main():
                         help='Enable torch.profiler (outputs Chrome trace)')
     parser.add_argument('--profile-batches', type=int, default=20,
                         help='Number of batches to profile (default: 20)')
+    parser.add_argument('--gradient-checkpointing', action='store_true',
+                        help='Recompute block activations in backward to fit a larger batch')
+    parser.add_argument('--grad-accum-steps', type=int, default=None,
+                        help='Split the per-GPU batch into this many micro-batches '
+                             '(effective batch size unchanged; lower peak memory)')
     parser.add_argument('--debug-batches', action='store_true',
                         help='Log every batch with CUDA sync (slow, for debugging crashes)')
+    parser.add_argument('--anneal-steps', type=int, default=None,
+                        help='On resume, cosine-decay from the CURRENT LR down to '
+                             'min_lr_ratio over this many steps (instead of the '
+                             'original full-length schedule), then hold. Pair with '
+                             '--max-batches to stop when the anneal completes.')
     args = parser.parse_args()
 
     # Load config
@@ -485,6 +788,26 @@ def main():
     precision = args.precision or train_cfg.get('precision', 'bf16')
     log_interval = train_cfg.get('log_interval', 100)
     checkpoint_every_n_shards = args.checkpoint_every_n_shards if args.checkpoint_every_n_shards is not None else train_cfg.get('checkpoint_every_n_shards', 100)
+    keep_last_n_checkpoints = args.keep_last_n_checkpoints if args.keep_last_n_checkpoints is not None else train_cfg.get('keep_last_n_checkpoints', 3)
+    # Gradient accumulation: `batch_size` is the effective per-GPU batch (so the
+    # LR schedule is defined in terms of it), split into `grad_accum_steps`
+    # micro-batches that are forwarded/backwarded in sequence with gradients
+    # summed in .grad, then a single optimizer step. This decouples the memory
+    # footprint (set by the micro-batch) from the effective batch size.
+    grad_accum_steps = args.grad_accum_steps if args.grad_accum_steps is not None else int(train_cfg.get('grad_accum_steps', 1))
+    if grad_accum_steps < 1:
+        raise ValueError(f"grad_accum_steps must be >= 1, got {grad_accum_steps}")
+    if batch_size % grad_accum_steps != 0:
+        raise ValueError(
+            f"batch_size ({batch_size}) must be divisible by grad_accum_steps ({grad_accum_steps})"
+        )
+    micro_batch = batch_size // grad_accum_steps
+    warmup_steps = int(train_cfg.get('warmup_steps', 0))
+    min_lr_ratio = float(train_cfg.get('min_lr_ratio', 0.1))
+    max_grad_norm = float(train_cfg.get('max_grad_norm', 1.0))
+    # Total optimizer steps, needed for cosine decay. Estimated from the number
+    # of training shards; if unknown (PGN mode) fall back to a large constant.
+    max_steps = train_cfg.get('max_steps')
 
     # Setup distributed
     rank, world_size, local_rank, is_distributed = setup_distributed()
@@ -493,7 +816,9 @@ def main():
     if rank == 0:
         print(f"Config: {config_path}")
         print(f"Training with {world_size} GPU(s)")
-        print(f"Batch size: {batch_size} (per GPU)")
+        print(f"Batch size: {batch_size} (per GPU, effective)")
+        if grad_accum_steps > 1:
+            print(f"Gradient accumulation: {grad_accum_steps} micro-batches of {micro_batch}")
         print(f"Learning rate: {lr}")
         print(f"Precision: {precision}")
         print(f"TF32: {args.tf32}")
@@ -501,12 +826,24 @@ def main():
 
     # Create model
     model_params = {key: int(model_cfg[key]) for key in ['d_model', 'n_heads', 'n_layers', 'd_ff']}
+    model_params['d_head'] = int(model_cfg.get('d_head', 64))
+    model_params['use_adaln'] = bool(model_cfg.get('use_adaln', True))
+    model_params['d_cond'] = int(model_cfg.get('d_cond', 128))
+    model_params['ffn_type'] = str(model_cfg.get('ffn_type', 'silu'))
+    model_params['gradient_checkpointing'] = bool(
+        args.gradient_checkpointing or model_cfg.get('gradient_checkpointing', False)
+    )
     model = ChessTransformer(**model_params)
     model = model.to(device)
 
-    # Cast to bf16 for fused RMSNorm kernels (avoids dtype mismatch with autocast)
-    if precision == 'bf16':
-        model = model.to(torch.bfloat16)
+    # NOTE: the model is intentionally kept in fp32 ("fp32 master weights").
+    # bf16 autocast casts activations/params to bf16 per-op for compute, but the
+    # parameters and optimizer state stay fp32. Permanently casting the model to
+    # bf16 (as before) also made AdamW's moment buffers bf16; with weight
+    # magnitudes ~0.02 the per-step update (~lr=1e-4) is roughly one bf16 ulp,
+    # so informative updates were rounded away and the optimizer carried ~0.4%
+    # relative error. The custom RMSNorm computes in fp32, so there is no
+    # autocast dtype mismatch.
 
     if rank == 0:
         print(f"Model params: {model_params}")
@@ -514,9 +851,22 @@ def main():
 
     # Compile model for faster training
     if args.compile:
+        compile_mode = args.compile_mode
+        # CUDA-graph modes ("reduce-overhead"/"max-autotune") reuse static output
+        # buffers across replays. With gradient accumulation we call the model
+        # several times per optimizer step and keep references to earlier
+        # outputs until the step ends, so a subsequent replay overwrites them
+        # ("accessing tensor output of CUDAGraphs that has been overwritten").
+        # "default" (Inductor, no CUDA graphs) has no such constraint and,
+        # measured here, is just as fast for this model.
+        if grad_accum_steps > 1 and compile_mode in ('reduce-overhead', 'max-autotune'):
+            if rank == 0:
+                print(f"Note: grad_accum_steps={grad_accum_steps} is incompatible with "
+                      f"torch.compile mode '{compile_mode}'; using 'default' instead.")
+            compile_mode = 'default'
         if rank == 0:
-            print(f"Compiling model with torch.compile(mode='{args.compile_mode}')...")
-        model = torch.compile(model, mode=args.compile_mode, fullgraph=True)
+            print(f"Compiling model with torch.compile(mode='{compile_mode}')...")
+        model = torch.compile(model, mode=compile_mode, fullgraph=True)
 
     # Initialize wandb
     use_wandb = args.wandb and rank == 0
@@ -573,22 +923,75 @@ def main():
 
     total_shards = None
     samples_per_shard = None
+    val_loader = None
     if parquet_patterns:
         parquet_paths = expand_globs(parquet_patterns)
+
+        # Hold out a fraction of shards for validation. Without this the loop
+        # only ever reports training metrics, so every architecture/optimizer
+        # A/B would measure fit rather than generalization. The split is taken
+        # deterministically from the end of the sorted shard list and is the
+        # same on every rank (so sharding stays consistent).
+        val_fraction = float(train_cfg.get('val_fraction', 0.0))
+        val_shards = []
+        if val_fraction > 0:
+            n_val = max(1, int(len(parquet_paths) * val_fraction))
+            if n_val >= len(parquet_paths):
+                raise ValueError(
+                    f"val_fraction={val_fraction} would hold out all {len(parquet_paths)} shards"
+                )
+            val_shards = parquet_paths[-n_val:]
+            parquet_paths = parquet_paths[:-n_val]
+
+        # Topology validation: every rank must receive at least one shard after
+        # rank sharding, and every rank's shards must cover at least one worker.
+        # Otherwise a rank produces zero batches and can never join the
+        # collectives, which previously manifested as a hang.
+        n_files = len(parquet_paths)
+        if world_size > n_files:
+            raise ValueError(
+                f"world_size={world_size} > number of training parquet shards={n_files}; "
+                f"some ranks would receive no data and deadlock. "
+                f"Reduce world_size or add shards."
+            )
+        # Note: idle DataLoader workers (when num_workers > shards-per-rank) are
+        # harmless - they simply yield nothing - so only the rank-level check
+        # above is a hard requirement.
+        # Computed on ALL ranks (not just rank 0) because the LR schedule and
+        # throughput/ETA estimates must be identical across ranks.
+        total_shards = len(parquet_paths)
+        samples_per_shard = get_samples_per_shard(parquet_paths)
         if rank == 0:
-            print(f"Parquet files: {len(parquet_paths)} shards")
-            samples_per_shard = get_samples_per_shard(parquet_paths)
-            total_shards = len(parquet_paths)
+            print(f"Parquet files: {len(parquet_paths)} train shards, {len(val_shards)} val shards")
             remaining_shards = total_shards - len(skip_shards)
             print(f"Total shards: {total_shards} (~{samples_per_shard:,} samples/shard)")
             if skip_shards:
                 print(f"Remaining shards: {remaining_shards}")
+
+        if val_shards:
+            # Validation uses the micro-batch size so a forward pass cannot OOM
+            # when the effective batch is large but only the micro-batch fits.
+            val_dataset = PGNDataset.from_parquet(
+                parquet_paths=val_shards,
+                rank=0,
+                world_size=1,
+                batch_size=micro_batch,
+                drop_last=True,  # keep the compiled forward at a single shape
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=1,
+                num_workers=0,
+                collate_fn=lambda x: x[0],
+            )
+
         dataset = PGNDataset.from_parquet(
             parquet_paths=parquet_paths,
             rank=rank,
             world_size=world_size,
-            batch_size=batch_size,
+            batch_size=micro_batch,
             skip_shards=skip_shards,
+            drop_last=True,  # keep the compiled forward at a single shape
         )
     elif pgn_patterns:
         pgn_paths = expand_globs(pgn_patterns)
@@ -619,6 +1022,39 @@ def main():
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, fused=True)
 
+    # LR schedule: linear warmup then cosine decay to min_lr_ratio * lr.
+    # Transformers benefit from warmup (early gradients are large/unstable) and
+    # from decay (large constant LR late in training adds noise near the
+    # optimum). max_steps is estimated from shard count when not given.
+    scheduler = None
+    if warmup_steps > 0 or min_lr_ratio < 1.0:
+        if max_steps is None and parquet_patterns:
+            # Approximate number of optimizer steps this rank will run:
+            # (training shards / world_size) * (rows/shard / batch_size).
+            try:
+                est_batches_per_shard = max(1, samples_per_shard // batch_size) if samples_per_shard else 1
+                shards_per_rank = max(1, total_shards // world_size)
+                max_steps = max(1, shards_per_rank * est_batches_per_shard)
+            except Exception:
+                max_steps = 1_000_000
+        if max_steps is None:
+            max_steps = 1_000_000
+
+        import math
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return (step + 1) / max(1, warmup_steps)
+            progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+            progress = min(1.0, max(0.0, progress))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        if rank == 0:
+            print(f"LR schedule: warmup {warmup_steps} steps, cosine to "
+                  f"{min_lr_ratio:.0%} of {lr:g} over ~{max_steps} steps")
+
     # Load model/optimizer state if resuming
     if resume_checkpoint:
         model_to_load = model.module if is_distributed else model
@@ -626,8 +1062,53 @@ def main():
         optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
         if scaler is not None and 'scaler_state_dict' in resume_checkpoint:
             scaler.load_state_dict(resume_checkpoint['scaler_state_dict'])
+        if scheduler is not None and 'scheduler_state_dict' in resume_checkpoint:
+            scheduler.load_state_dict(resume_checkpoint['scheduler_state_dict'])
         if rank == 0:
             print("Loaded model and optimizer state from checkpoint")
+
+    # Optional shortened anneal on resume. The full cosine runs over ~561k
+    # steps; if validation loss has flattened and the remaining full-length
+    # schedule would cost tens of GPU-hours for a tiny gain, this cosine-decays
+    # from the *current* LR down to min_lr_ratio over --anneal-steps and then
+    # holds. It is continuous with the old schedule (starts at the exact LR in
+    # the checkpoint), so there is no jump. Stop it with
+    # --max-batches <anneal-steps>.
+    if args.anneal_steps is not None:
+        if not resume_checkpoint:
+            raise ValueError("--anneal-steps requires --resume (nothing to anneal from)")
+        import math as _math
+
+        anneal_start = int(
+            resume_checkpoint.get('scheduler_state_dict', {}).get('last_epoch', 0)
+        )
+        start_lr = float(resume_checkpoint['optimizer_state_dict']['param_groups'][0]['lr'])
+        start_ratio = start_lr / lr
+
+        def anneal_lambda(step: int) -> float:
+            if step <= anneal_start:
+                return start_ratio
+            p = (step - anneal_start) / max(1, args.anneal_steps)
+            p = min(1.0, max(0.0, p))
+            cos = 0.5 * (1.0 + _math.cos(_math.pi * p))
+            return min_lr_ratio + (start_ratio - min_lr_ratio) * cos
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, anneal_lambda)
+        # LambdaLR captures base_lrs from the optimizer's CURRENT lr, which the
+        # resume just set to the already-decayed value. Pin the base to the peak
+        # lr so lr_lambda (a ratio of peak) is not applied twice.
+        scheduler.base_lrs = [lr] * len(optimizer.param_groups)
+        scheduler.last_epoch = anneal_start
+        for g in optimizer.param_groups:
+            g['lr'] = start_lr
+        scheduler._last_lr = [start_lr]
+        if rank == 0:
+            print(
+                f"Anneal: cosine from {start_ratio*lr:g} ({start_ratio:.2f}x) "
+                f"down to {min_lr_ratio*lr:g} ({min_lr_ratio:.0%}x) over "
+                f"{args.anneal_steps} steps, starting at global step {anneal_start}; "
+                f"stop with --max-batches {args.anneal_steps}"
+            )
 
     # Training loop
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
@@ -668,27 +1149,44 @@ def main():
     if rank == 0:
         print(f"\nStarting training (checkpoint every {checkpoint_every_n_shards} shards)")
 
-    stats = train_epoch(
-        model=model,
-        dataloader=dataloader,
-        optimizer=optimizer,
-        device=device,
-        precision=precision,
-        scaler=scaler,
-        rank=rank,
-        world_size=world_size,
-        log_interval=log_interval,
-        total_shards=total_shards,
-        samples_per_shard=samples_per_shard,
-        use_wandb=use_wandb,
-        max_batches=args.max_batches,
-        profiler=profiler,
-        checkpoint_dir=checkpoint_dir,
-        checkpoint_every_n_shards=checkpoint_every_n_shards,
-        is_distributed=is_distributed,
-        initial_completed_shards=skip_shards,
-        debug_batches=args.debug_batches,
-    )
+    # If any rank raises (corrupt data, OOM, NCCL error), tear down the process
+    # group so peers fail fast instead of blocking forever in a collective.
+    try:
+        stats = train_epoch(
+            model=model,
+            dataloader=dataloader,
+            optimizer=optimizer,
+            device=device,
+            precision=precision,
+            scaler=scaler,
+            rank=rank,
+            world_size=world_size,
+            log_interval=log_interval,
+            total_shards=total_shards,
+            samples_per_shard=samples_per_shard,
+            use_wandb=use_wandb,
+            max_batches=args.max_batches,
+            profiler=profiler,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_every_n_shards=checkpoint_every_n_shards,
+            is_distributed=is_distributed,
+            initial_completed_shards=skip_shards,
+            debug_batches=args.debug_batches,
+            val_loader=val_loader,
+            eval_interval=train_cfg.get('eval_interval'),
+            val_max_batches=train_cfg.get('val_max_batches', 20),
+            scheduler=scheduler,
+            max_grad_norm=max_grad_norm,
+            keep_last_n_checkpoints=keep_last_n_checkpoints,
+            grad_accum_steps=grad_accum_steps,
+        )
+    except Exception:
+        if is_distributed:
+            try:
+                dist.abort()
+            except Exception:
+                pass
+        raise
 
     if rank == 0:
         print(f"\nTraining pass complete:")
@@ -698,25 +1196,23 @@ def main():
             print(f"  Promo accuracy: {stats['promo_accuracy']*100:.1f}%")
         print(f"  Shards completed: {len(stats['completed_shards'])}")
 
-    # Barrier to ensure all ranks finish training before checkpointing
-    # (needed because shards may have different row counts)
-    if is_distributed:
-        dist.barrier()
-
-    # Save final checkpoint (all ranks must call due to all_gather_object inside)
-    completed_shards = stats['completed_shards']
-    if completed_shards:
-        final_checkpoint_path = checkpoint_dir / 'checkpoint_final.pt'
-        save_checkpoint(
-            path=final_checkpoint_path,
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            completed_shards=completed_shards,
-            is_distributed=is_distributed,
-            rank=rank,
-            world_size=world_size,
-        )
+    # Save final checkpoint. ALL ranks must call this unconditionally because
+    # save_checkpoint performs an all_gather_object across ranks; only rank 0
+    # actually writes, and it skips writing if no shards completed. Guarding
+    # the call itself with `if completed_shards` (as before) would hang any
+    # rank whose set happened to be empty.
+    final_checkpoint_path = checkpoint_dir / 'checkpoint_final.pt'
+    save_checkpoint(
+        path=final_checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        completed_shards=stats['completed_shards'],
+        is_distributed=is_distributed,
+        rank=rank,
+        world_size=world_size,
+        scheduler=scheduler,
+    )
 
     if profiler is not None:
         profiler.stop()

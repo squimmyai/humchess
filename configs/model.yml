@@ -1,8 +1,13 @@
 model:
   d_model: 384
-  n_heads: 8
-  n_layers: 11
+  n_heads: 6        # head_dim = 384/6 = 64 (tensor-core aligned)
+  n_layers: 14
   d_ff: 1536
+  d_head: 64        # square-pair move head inner dim (>=64 for full rank)
+  use_adaln: true   # AdaLN-Zero conditioning on Elo/time
+  d_cond: 128       # conditioning vector width for AdaLN
+  ffn_type: swiglu  # 'silu' (2-matrix) or 'swiglu' (gated, equal params)
+  gradient_checkpointing: false  # micro-batching (grad_accum_steps) fits without the ~33% recompute cost
 
 data:
   # Parquet shards - supports globs and directories
@@ -22,10 +27,33 @@ data:
 
 training:
   checkpoint_dir: checkpoints
+  # Retain only the N most recent shard checkpoints. A full epoch writes ~100 of
+  # them (~0.4 GB each); without rotation they overflow the instance disk.
+  keep_last_n_checkpoints: 3
+  # Effective per-GPU batch. Split into grad_accum_steps micro-batches so each
+  # forward fits without gradient checkpointing. Larger micro-batches use the
+  # GPU better: measured global throughput at effective batch 12000 was
+  # 14.3k/s (micro 750), 17.0k/s (micro 1000), 20.6k/s (micro 1500). The
+  # accumulation count itself doesn't affect speed (allreduce isn't the
+  # bottleneck), so we split as little as memory allows.
   batch_size: 3000
+  grad_accum_steps: 2
   lr: 1e-4
   epochs: 1
+  # LR schedule: linear warmup then cosine decay to min_lr_ratio * lr.
+  warmup_steps: 1000
+  min_lr_ratio: 0.1
+  # Gradient clipping (max L2 norm); set to 0 or null to disable.
+  max_grad_norm: 1.0
+  # Total optimizer steps for the cosine schedule. Leave unset to estimate from
+  # the shard count.
+  # max_steps:
   num_workers: 12
   prefetch_factor: 4  # batches to prefetch per worker
   precision: bf16  # bf16, fp16, fp32
-  log_interval: 100
+  log_interval: 200
+  # Validation split: fraction of shards held out (from the end of the sorted
+  # list) to measure generalization. 0 disables validation.
+  val_fraction: 0.005
+  eval_interval: 2000   # run validation every N steps
+  val_max_batches: 20   # batches per validation pass (bounds its cost)
